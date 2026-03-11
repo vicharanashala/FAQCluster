@@ -1,0 +1,28 @@
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Machine Learning & Clustering
+scikit-learn>=1.3.0
+hdbscan>=0.8.33
+umap-learn>=0.5.4
+
+# NLP / Embeddings
+sentence-transformers>=2.2.2
+transformers>=4.30.0
+accelerate>=0.20.0
+
+# Fuzzy matching & dedup
+rapidfuzz>=3.0.0
+
+# Config / Misc
+pyyaml>=6.0
+tqdm>=4.65.0
+scipy>=1.11.0
+
+# LLM API (optional — only needed for Anthropic / Claude)
+anthropic>=0.25.0
+
+# PyTorch — install separately with the right CUDA build for your system
+# https://pytorch.org/get-started/locally/
+# torch>=2.0.0

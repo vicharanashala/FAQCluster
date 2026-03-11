@@ -1,0 +1,207 @@
+# Irrelevant Query Corpus
+# Keywords that indicate non-paddy-specific or irrelevant queries
+
+categories:
+  market_price:
+    description: "Market, price, and selling related queries"
+    keywords:
+      - market
+      - mandi
+      - market price
+      - mandi rate
+      - mandi price
+      - bazar rate
+      - bazaar rate
+      - rate of mandi
+      - selling price
+      - cost of selling
+      - trader
+      - dealer
+      - commission
+      - arhtiya
+      - agency
+    typos:
+      - markit
+      - markeet
+      - prise
+      - pric
+      - sellin
+      - buyin
+      - mandy
+      
+  weather:
+    description: "Weather and climate queries"
+    keywords:
+      - weather
+      - rain
+      - rainfall
+      - temperature
+      - climate
+      - forecast
+      - monsoon
+      - drought
+      - flood
+      - cyclone
+      - storm
+    typos:
+      - wheather
+      - wether
+      - rainfal
+      - forcast
+      - monsun
+      - drout
+      
+  machinery:
+    description: "Agricultural machinery queries"
+    keywords:
+      - tractor
+      - machine
+      - machinery
+      - equipment
+      - harvester
+      - thresher
+      - cultivator
+      - plough
+      - plow
+      - sprayer
+      - pump
+    typos:
+      - tracter
+      - tracktor
+      - machinary
+      - equipement
+      - harvster
+      - threshar
+      
+  training:
+    description: "Training and education queries"
+    keywords:
+      - training
+      - workshop
+      - seminar
+      - course
+      - class
+      - education
+      - learn
+      - teach
+      - demonstration
+      - demo
+    typos:
+      - trainning
+      - workshp
+      - seminer
+      - corse
+      - cours
+      - educaton
+      
+  incomplete_call:
+    description: "Incomplete or wrong calls"
+    keywords:
+      - incomplete
+      - wrong number
+      - disconnected
+      - no response
+      - not connected
+      - call drop
+      - network
+      - no answer
+      - busy
+      - unavailable
+    typos:
+      - incomplet
+      - disconected
+      - respons
+      - netwrk
+      
+  subsidy_scheme:
+    description: "Subsidy and government scheme queries"
+    keywords:
+      - subsidy
+      - scheme
+      - yojana
+      - benefit
+      - assistance
+      - loan
+      - credit
+      - insurance
+      - compensation
+      - grant
+      - aid
+      - support yojana
+      - government scheme
+      - ministery
+    typos:
+      - subsidy
+      - schem
+      - yojna
+      - benfit
+      - assistence
+      - lon
+      - insurence
+      - compensaton
+      - goverment
+      - compensaton
+      - goverment
+      - ministery
+  irrelevant:
+    description: "General irrelevant or spam queries"
+    keywords:
+      - irrelevant
+      - spam
+      - test
+      - testing
+      - random
+    typos:
+      - irrelev
+
+  banking_admin:
+    description: "Banking, KCC, and Administrative queries"
+    keywords:
+      - kcc
+      - kisan credit card
+      - account
+      - bank
+      - manager
+      - branch
+      - ifsc
+      - helpline
+      - contact number
+      - phone number
+      - mobile number
+      - call center
+      - vacancy
+      - job
+      - recruit
+    typos:
+      - acount
+      - manger
+      - contect
+
+  contact_details:
+    description: "Requests for contact numbers of agricultural officers, KVK, or crop experts"
+    keywords:
+      - contact no
+      - contact number
+      - phone no
+      - phone number
+      - mobile no
+      - mobile number
+      - chief agricultural officer
+      - agricultural officer
+      - kvk
+      - krishi vigyan kendra
+      - helpline number
+      - toll free
+      - information regarding contact
+      - contact of officer
+      - experts in crop
+      - expert contact
+    typos:
+      - contect no
+      - mobil no
+      - agricultral officer
+      - agri officer
+      - kvk no
+
+# Minimum word length to consider (avoid matching short words)
+min_word_length: 3

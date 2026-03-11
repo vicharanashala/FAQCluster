@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Data & outputs (too large / user-specific)
+data/
+outputs/
+
+# Secrets
+.env
+*.env
+
+# Editor
+.vscode/
+.idea/
+*.swp
