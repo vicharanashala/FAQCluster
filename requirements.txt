@@ -26,3 +26,8 @@ anthropic>=0.25.0
 # PyTorch — install separately with the right CUDA build for your system
 # https://pytorch.org/get-started/locally/
 # torch>=2.0.0
+
+# vLLM — required only for Stage 7 (Q&A generation via batch inference)
+# Install separately after PyTorch:
+#   pip install vllm>=0.6.0
+# See https://docs.vllm.ai/en/latest/getting_started/installation.html

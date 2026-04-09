@@ -1,11 +1,11 @@
 # kcc_faq — KCC FAQ Generation Pipeline
 
 Self-contained end-to-end pipeline that turns raw **Kisan Call Centre (KCC)** query data
-into a clean, ranked **FAQ CSV** of answer-distinct agricultural questions with their
-real-world call frequencies.
+into a clean, ranked **FAQ CSV** of answer-distinct agricultural questions with
+professionally generated English Q&A pairs.
 
 ```
-Raw KCC CSV  →  Clustering  →  LLM Repair  →  Unique-Q Extraction  →  Filtered FAQ
+Raw KCC CSV → Clustering → LLM Repair → Unique-Q Extraction → Filtered FAQ → Q&A Generation
 ```
 
 ---
@@ -27,13 +27,16 @@ Raw KCC CSV  →  Clustering  →  LLM Repair  →  Unique-Q Extraction  →  Fi
 ## Setup
 
 ```bash
-# From the KCC Analysis/ root directory
+# From the project root
 python -m venv venv
 source venv/bin/activate
-pip install -r kcc_faq/requirements.txt
+pip install -r requirements.txt
 
 # Install PyTorch separately with your CUDA version, e.g.:
 pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# For Stage 7 (Q&A generation), install vLLM:
+pip install vllm>=0.6.0
 ```
 
 ---
@@ -43,19 +46,29 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 ### Option A — With Claude Haiku (recommended for Stage 4)
 
 ```bash
-python kcc_faq/run_pipeline.py \
+python run_pipeline.py \
     --raw-file data/raw/punjab_maize_raw.csv \
     --crop "Maize Makka" \
     --api-key sk-ant-...
 ```
 
-### Option B — Fully local (Qwen 7B for all LLM stages)
+### Option B — Fully local (Qwen 7B for all LLM stages + Q&A generation)
 
 ```bash
-python kcc_faq/run_pipeline.py \
+python run_pipeline.py \
     --raw-file data/raw/punjab_maize_raw.csv \
     --crop "Maize Makka" \
     --model /path/to/qwen2.5-7b-instruct
+```
+
+### Option C — Stages 1–6 only (skip Q&A generation)
+
+```bash
+python run_pipeline.py \
+    --raw-file data/raw/punjab_maize_raw.csv \
+    --crop "Maize Makka" \
+    --model /path/to/qwen2.5-7b-instruct \
+    --skip-qa-gen
 ```
 
 > **Note:** `--raw-file` should contain a `Crop` column and a `QueryText` column
@@ -73,7 +86,8 @@ flowchart LR
     D --> E["Stage 4\nUnique-Q\nExtraction"]
     E --> F["Stage 5\nDedup"]
     F --> G["Stage 6\nCorpus Filter"]
-    G --> H["✅ FAQ CSV"]
+    G --> H["Stage 7\nQ&A Gen\nvLLM Batch"]
+    H --> I["✅ FAQ Q&A CSV"]
 ```
 
 ### Stage 1 — Phase 1: Hyperparameter Screening
@@ -197,10 +211,46 @@ Removed rows are saved to `corpus_filtered_out.csv` for auditing.
 
 ---
 
+### Stage 7 — Q&A Generation (vLLM Batch Inference)
+
+**Script:** `pipeline/vllm_batch_qa_generator.py`  
+**Model:** Qwen2.5-7B-Instruct via **vLLM offline batch inference**
+
+Generates professional English Q&A pairs for each unique question in the FAQ.
+
+- Uses vLLM's offline `LLM.generate()` for high-throughput batch processing
+- Crop-specific system prompts with expert agricultural hints
+- Automatic irrelevant-crop rejection (synonym-aware)
+- Mandatory English output — translates Hindi/Hinglish input automatically
+- Each answer includes: step-by-step technical guidance, chemical dosages, safety notes, and a KVK referral footer
+
+**Output format per row:**
+
+| Column | Description |
+|--------|-------------|
+| `Generated_Question` | Polished English version of the farmer's question |
+| `Generated_Category` | One of: Disease, Pest, Fertilizer and Nutrient, Variety, Agronomy, Other, IRRELEVANT_CROP |
+| `Generated_Answer` | 200–400 word professional technical answer |
+
+**Controls:** `--skip-qa-gen`, `--model`
+
+**Outputs:** `unique_questions_freq_qa.csv`
+
+**Standalone usage:**
+```bash
+python pipeline/vllm_batch_qa_generator.py \
+    --input  outputs/repair/maize_makka/unique_questions_freq.csv \
+    --crop   "Maize Makka" \
+    --model  /path/to/qwen2.5-7b-instruct \
+    --gpu-util 0.90
+```
+
+---
+
 ## CLI Reference
 
 ```
-python kcc_faq/run_pipeline.py --help
+python run_pipeline.py --help
 ```
 
 ### I/O (Required)
@@ -229,7 +279,8 @@ python kcc_faq/run_pipeline.py --help
 | `--skip-repair` | — | Skip Stage 3 — use existing `cluster_questions.csv` |
 | `--skip-unique-q` | — | Skip Stage 4 — use existing `unique_questions_freq.csv` |
 | `--skip-corpus-filter` | — | Skip Stage 6 |
-| `--corpus-file PATH` | `kcc_faq/config/irrelevant_corpus.yaml` | Path to irrelevant keywords YAML |
+| `--skip-qa-gen` | — | Skip Stage 7 (Q&A generation via vLLM) |
+| `--corpus-file PATH` | `config/irrelevant_corpus.yaml` | Path to irrelevant keywords YAML |
 
 ### Tuning Parameters
 
@@ -256,22 +307,35 @@ Each stage writes intermediate files. If a run fails, you can resume from any st
 
 ```bash
 # Resume from Stage 2 (Phase 1 already done)
-python kcc_faq/run_pipeline.py \
+python run_pipeline.py \
     --raw-file data/raw/punjab_maize_raw.csv \
     --crop "Maize Makka" \
     --skip-phase1
 
 # Resume from Stage 4 (Stages 1–3 done)
-python kcc_faq/run_pipeline.py \
+python run_pipeline.py \
     --raw-file data/raw/punjab_maize_raw.csv \
     --crop "Maize Makka" \
     --skip-phase1 --skip-phase2 --skip-repair \
     --api-key sk-ant-...
 
-# Run only Stage 6 (filter on existing FAQ)
-python kcc_faq/pipeline/filter_faq_corpus.py \
+# Run only Stage 7 (Q&A generation on existing FAQ)
+python run_pipeline.py \
+    --raw-file data/raw/punjab_maize_raw.csv \
+    --crop "Maize Makka" \
+    --skip-phase1 --skip-phase2 --skip-repair \
+    --skip-unique-q --skip-corpus-filter
+
+# Run Stage 7 standalone
+python pipeline/vllm_batch_qa_generator.py \
     --input  outputs/repair/maize_makka/unique_questions_freq.csv \
-    --corpus kcc_faq/config/irrelevant_corpus.yaml
+    --crop   "Maize Makka" \
+    --model  /path/to/qwen2.5-7b-instruct
+
+# Run only Stage 6 (filter on existing FAQ)
+python pipeline/filter_faq_corpus.py \
+    --input  outputs/repair/maize_makka/unique_questions_freq.csv \
+    --corpus config/irrelevant_corpus.yaml
 ```
 
 ---
@@ -289,7 +353,8 @@ All outputs are written to `outputs/repair/<crop_slug>/`:
 | `cluster_questions.csv` | Every question per repaired cluster |
 | `raw_row_mapping.csv` | Every original raw row → final cluster ID |
 | `unique_questions.csv` | All unique question groups with full metadata |
-| ⭐ `unique_questions_freq.csv` | **Primary FAQ output** — ranked by call frequency |
+| ⭐ `unique_questions_freq.csv` | **FAQ questions** — ranked by call frequency |
+| ⭐ `unique_questions_freq_qa.csv` | **FAQ Q&A pairs** — questions + generated answers (Stage 7) |
 | `unique_question_mapping.csv` | Every input question → unique group ID |
 | `corpus_filtered_out.csv` | Rows removed by Stage 6 (for auditing) |
 
@@ -314,7 +379,7 @@ All outputs are written to `outputs/repair/<crop_slug>/`:
 
 ## Irrelevant Corpus Filter
 
-The corpus filter config lives in `kcc_faq/config/irrelevant_corpus.yaml`.
+The corpus filter config lives in `config/irrelevant_corpus.yaml`.
 To **add new irrelevant categories**, open the YAML and add a new block:
 
 ```yaml
@@ -342,3 +407,4 @@ The filter will pick it up automatically on the next run — no code changes nee
 | Stage 4 — Unique-Q | GPU **or** API | Claude Haiku via `--api-key` requires no GPU |
 | Stage 5 — Dedup | CPU only | Instant |
 | Stage 6 — Filter | CPU only | ~1 sec for 1000 rows |
+| Stage 7 — Q&A Gen | **GPU required** | vLLM loads Qwen2.5-7B (~16 GB VRAM); ~50–100 rq/s on RTX 4090+ |

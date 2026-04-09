@@ -4,14 +4,14 @@ run_pipeline.py — End-to-end KCC FAQ Generation Pipeline
 
 Self-contained entry point for the entire KCC FAQ pipeline.
 Runs clustering → LLM evaluation → cluster repair → unique question
-extraction → deduplication → irrelevant corpus filtering.
+extraction → deduplication → irrelevant corpus filtering → Q&A generation.
 
-Usage (from the KCC Analysis/ root):
-    python kcc_faq/run_pipeline.py \\
+Usage (from the project root):
+    python run_pipeline.py \\
         --raw-file data/raw/punjab_maize_raw.csv \\
         --crop "Maize Makka" \\
         --api-key sk-ant-...          # Anthropic Claude for Stage 4
-        [--model /path/to/qwen]      # local Qwen 7B (Stages 2-3)
+        [--model /path/to/qwen]      # local Qwen 7B (Stages 2-3, 7)
         [--grid-mode medium] \\
         [--output-dir outputs/repair]
 
@@ -23,10 +23,12 @@ Pipeline Stages:
     4. Unique  — Unique question extraction (Claude Haiku or local Qwen)
     5. Dedup   — Final deduplication
     6. Filter  — Irrelevant corpus filtering (removes contact/weather/market queries)
+    7. Q&A Gen — Generate English FAQ Q&A pairs via vLLM batch inference
 
 Output:
-    outputs/repair/<crop_slug>/unique_questions_freq.csv
-    outputs/repair/<crop_slug>/corpus_filtered_out.csv  (removed rows)
+    outputs/repair/<crop_slug>/unique_questions_freq.csv     (FAQ questions)
+    outputs/repair/<crop_slug>/unique_questions_freq_qa.csv  (FAQ Q&A pairs)
+    outputs/repair/<crop_slug>/corpus_filtered_out.csv       (removed rows)
 """
 
 import sys
@@ -58,7 +60,7 @@ def slug(name: str) -> str:
 
 
 def run_phase1(args, out_dir: Path):
-    banner("Stage 1/6 — Phase 1: Hyperparameter Screening")
+    banner("Stage 1/7 — Phase 1: Hyperparameter Screening")
     from pipeline.hyperparameter_tuning import (
         generate_param_grid, phase1_fast_screening, load_stopwords,
         ClusteringResult,
@@ -110,7 +112,7 @@ def run_phase1(args, out_dir: Path):
 
 
 def run_phase2(args, out_dir: Path, candidates: list) -> str:
-    banner("Stage 2/6 — Phase 2: LLM Evaluation")
+    banner("Stage 2/7 — Phase 2: LLM Evaluation")
     from pipeline.cluster_repair import RepairJudge, run_phase2 as _run_phase2
 
     best_cfg = _run_phase2(
@@ -123,7 +125,7 @@ def run_phase2(args, out_dir: Path, candidates: list) -> str:
 
 
 def run_repair(args, out_dir: Path, candidates: list, best_cfg: str):
-    banner("Stage 3/6 — Cluster Repair (Steps A–E)")
+    banner("Stage 3/7 — Cluster Repair (Steps A–E)")
     import copy
     from pipeline.cluster_repair import (
         RepairJudge, step_a_diverse_reps, step_b_cross_crop,
@@ -189,7 +191,7 @@ def run_repair(args, out_dir: Path, candidates: list, best_cfg: str):
 
 
 def run_unique_questions(args, out_dir: Path):
-    banner("Stage 4/6 — Unique Question Extraction")
+    banner("Stage 4/7 — Unique Question Extraction")
     cluster_file = out_dir / 'cluster_questions.csv'
     if not cluster_file.exists():
         sys.exit(f"ERROR: {cluster_file} not found. Run repair stage first.")
@@ -219,7 +221,7 @@ def run_unique_questions(args, out_dir: Path):
 
 
 def run_dedup(out_dir: Path):
-    banner("Stage 5/6 — Final Deduplication")
+    banner("Stage 5/7 — Final Deduplication")
     freq_csv = out_dir / 'unique_questions_freq.csv'
     if not freq_csv.exists():
         sys.exit(f"ERROR: {freq_csv} not found. Run unique-question stage first.")
@@ -237,7 +239,7 @@ def run_dedup(out_dir: Path):
 
 def run_corpus_filter(out_dir: Path, corpus_file: str, fuzz_thresh: int = 85):
     """Stage 6: Remove irrelevant representative questions via corpus filter."""
-    banner("Stage 6/6 — Irrelevant Corpus Filtering")
+    banner("Stage 6/7 — Irrelevant Corpus Filtering")
     freq_csv = out_dir / 'unique_questions_freq.csv'
     if not freq_csv.exists():
         sys.exit(f"ERROR: {freq_csv} not found. Run dedup stage first.")
@@ -255,6 +257,31 @@ def run_corpus_filter(out_dir: Path, corpus_file: str, fuzz_thresh: int = 85):
     )
     print(f"\n  ✓ Corpus filter complete — {len(kept_df)} rows kept, "
           f"{len(removed_df)} rows removed")
+
+
+def run_qa_gen(args, out_dir: Path):
+    """Stage 7: Generate FAQ Q&A pairs via vLLM batch inference."""
+    banner("Stage 7/7 — Q&A Generation (vLLM Batch Inference)")
+    freq_csv = out_dir / 'unique_questions_freq.csv'
+    if not freq_csv.exists():
+        sys.exit(f"ERROR: {freq_csv} not found. Run Stages 1–6 first.")
+
+    qa_csv = out_dir / 'unique_questions_freq_qa.csv'
+    print(f"  Input  : {freq_csv}")
+    print(f"  Output : {qa_csv}")
+    print(f"  Model  : {args.model}")
+    print(f"  Crop   : {args.crop}")
+
+    from pipeline.vllm_batch_qa_generator import run_qa_generation
+    run_qa_generation(
+        input_csv=str(freq_csv),
+        output_csv=str(qa_csv),
+        crop=args.crop,
+        model=args.model,
+        tp=1,
+        gpu_util=0.90,
+    )
+    print(f"\n  ✓ Q&A generation complete — {qa_csv}")
 
 
 def load_candidates(out_dir: Path) -> list:
@@ -327,6 +354,8 @@ def parse_args():
                       help='Skip unique question extraction — use existing unique_questions_freq.csv')
     ctrl.add_argument('--skip-corpus-filter', action='store_true',
                       help='Skip corpus-based irrelevant query removal (Stage 6)')
+    ctrl.add_argument('--skip-qa-gen', action='store_true',
+                      help='Skip Q&A generation via vLLM (Stage 7)')
     ctrl.add_argument('--corpus-file',
                       default=str(DEFAULT_CORPUS),
                       help=('Path to irrelevant_corpus.yaml '
@@ -418,17 +447,30 @@ def main():
         else:
             run_corpus_filter(out_dir, args.corpus_file, args.fuzz_threshold)
 
+    # ── Stage 7: Q&A Generation ───────────────────────────────────────────────
+    if args.skip_qa_gen:
+        print("\n[--skip-qa-gen] Skipping Q&A generation")
+    else:
+        run_qa_gen(args, out_dir)
+
     # ── Done ──────────────────────────────────────────────────────────────────
     elapsed = datetime.now() - start_time
     banner("Pipeline Complete!")
     faq = out_dir / 'unique_questions_freq.csv'
-    print(f"  ⭐ Final FAQ  : {faq}")
-    print(f"  Elapsed      : {elapsed}")
-    print(f"\n  Output columns:")
+    qa  = out_dir / 'unique_questions_freq_qa.csv'
+    print(f"  ⭐ FAQ (questions) : {faq}")
+    if qa.exists():
+        print(f"  ⭐ FAQ (Q&A pairs) : {qa}")
+    print(f"  Elapsed           : {elapsed}")
+    print(f"\n  FAQ columns (unique_questions_freq.csv):")
     print("    unique_q_id, representative_question, raw_frequency,")
     print("    pct_of_total, cluster_id, cluster_label, answer_label,")
     print("    n_questions_in_group, was_cluster_split, parent_cluster,")
     print("    merged_from, merged_cross_cluster")
+    if qa.exists():
+        print(f"\n  Q&A columns (unique_questions_freq_qa.csv):")
+        print("    ... all of the above, plus:")
+        print("    Generated_Question, Generated_Category, Generated_Answer")
     print()
 
 
