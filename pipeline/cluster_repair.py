@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
+import logging 
 
 SCRIPT_DIR   = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -150,14 +151,30 @@ class RepairJudge(LocalHFJudge):
         return self.tokenizer.decode(new, skip_special_tokens=True).strip()
 
     @staticmethod
-    def _parse_json_list(raw: str) -> list:
-        m = re.search(r'\[.*\]', raw, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group())
-            except Exception:
-                pass
-        return []
+    def _parse_json_list(self, raw: str) -> list:
+        text = re.sub(r"```json|```", "", raw).strip()
+        
+        m = re.search(r'\[.*\]', text, re.DOTALL)
+        if not m:
+            logging.warning(f"no JSON array found: {raw[:200]}")
+            return []
+        
+        try:
+            parsed = json.loads(m.group())
+        except json.JSONDecodeError as e:
+            logging.warning(f"JSON decode failed: {e} | raw: {raw[:200]}")
+            return []
+        
+        if not isinstance(parsed, list):
+            logging.warning(f"expected list, got {type(parsed)}")
+            return []
+        
+        valid = [g for g in parsed if isinstance(g, dict) and "indices" in g]
+        
+        if len(valid) != len(parsed):
+            logging.warning(f"dropped {len(parsed) - len(valid)} invalid items")
+        
+        return valid
 
     @staticmethod
     def _parse_json_obj(raw: str) -> dict:
@@ -233,7 +250,7 @@ class RepairJudge(LocalHFJudge):
             f'{{"group":2,"label":"nutrient deficiency","indices":[4,5]}}]\nJSON:'
         )
         raw       = self._gen_long(prompt, max_new_tokens=350)
-        groups_raw = self._parse_json_list(raw)
+        groups_raw = self._parse_json_list(self,raw)
 
         result, seen = [], set()
         for g in groups_raw:
