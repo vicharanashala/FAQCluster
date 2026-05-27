@@ -32,14 +32,11 @@ categories:
   weather:
     description: "Weather and climate queries"
     keywords:
-      - weather
-      - rain
-      - rainfall
-      - temperature
-      - climate
+      - weather report
+      - weather forecast
+      - climate forecast
       - forecast
       - monsoon
-      - drought
       - flood
       - cyclone
       - storm
@@ -63,7 +60,6 @@ categories:
       - cultivator
       - plough
       - plow
-      - sprayer
       - pump
     typos:
       - tracter

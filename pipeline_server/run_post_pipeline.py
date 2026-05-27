@@ -81,17 +81,22 @@ def run_dedup(input_dir: Path, crops: list | None = None):
         if _ctl:
             _ctl.check_cancel()
 
+        _cancel_ev = None
+        if _ctl:
+            _jid = _ctl.current_job_id()
+            if _jid:
+                _cancel_ev = _ctl.get_cancel_event(_jid)
+
         print(f"\n  Processing: {crop_dir.name}/{SOURCE_FILE}")
         try:
             df = pd.read_csv(source, low_memory=False)
-            df, df_phase = deduplicate_and_aggregate(df)
+            df, df_phase = deduplicate_and_aggregate(df, cancel_event=_cancel_ev)
         except Exception as e:
             print(f"  [ERROR] {crop_dir.name}: {e}")
             continue
 
         dedup_out_name = f"{crop_dir.parent.name}_{crop_dir.name}.csv"
         df_phase.to_csv(crop_dir / PHASE_OUT, index=False)
-        df = df[df['answer_label'] != "(unclassified)"]
         df.to_csv(crop_dir / dedup_out_name, index=False)
         print(f"  Saved: {crop_dir.name}/{PHASE_OUT}")
         print(f"  Saved: {crop_dir.name}/{dedup_out_name}")

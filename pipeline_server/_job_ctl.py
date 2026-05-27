@@ -74,6 +74,10 @@ def make_event(job_id: str) -> threading.Event:
     return ev
 
 
+def get_cancel_event(job_id: str) -> Optional[threading.Event]:
+    return _cancel_events.get(job_id)
+
+
 def cleanup(job_id: str) -> None:
     _cancel_events.pop(job_id, None)
     _active_procs.pop(job_id, None)

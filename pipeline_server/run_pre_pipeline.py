@@ -17,6 +17,8 @@ Output:
     <output>  — normalized CSV ready to pass as --raw-file to run_pipeline.py / run_full.py
 """
 
+import os
+import signal
 import sys
 import subprocess
 import argparse
@@ -41,14 +43,28 @@ def banner(msg: str):
 
 
 def _stream(cmd: list) -> None:
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, preexec_fn=os.setsid,
+    )
     if _ctl:
         _ctl.register_proc(proc)
+    cancelled = False
     for line in proc.stdout:
         print(line, end="", flush=True)
+        if _ctl and _ctl.is_cancelled(_ctl.current_job_id()):
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+            cancelled = True
+            break
     proc.wait()
     if _ctl:
         _ctl.deregister_proc()
+    if cancelled:
+        raise _ctl.JobCancelled(_ctl.current_job_id())
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
 

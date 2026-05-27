@@ -48,6 +48,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Optional
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
+except ImportError:
+    pass
+
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -247,7 +253,7 @@ class PipelineRequest(BaseModel):
     crops: Optional[List[str]] = None
     domains: Optional[List[str]] = None
     output_dir: str = "outputs/repair"
-    model: str = "google/gemma-4-26B-A4B-it"
+    model: str = os.environ.get("LLM_MODEL", "google/gemma-4-26B-A4B-it")
     api_key: Optional[str] = None
     gpu_id: int = 1
     batch_size: int = 8
@@ -285,7 +291,7 @@ class FullRequest(BaseModel):
     domains: Optional[List[str]] = None
     output_dir: str = "outputs/repair"
     pre_output: Optional[str] = None
-    model: str = "google/gemma-4-26B-A4B-it"
+    model: str = os.environ.get("LLM_MODEL", "google/gemma-4-26B-A4B-it")
     api_key: Optional[str] = None
     gpu_id: int = 1
     batch_size: int = 8
@@ -329,6 +335,7 @@ def _run_pre_sync(r: PreRequest) -> None:
     intermediate = output_path.parent / f"{output_path.stem}_state_rows.csv"
 
     run_state_filter(input_path, r.state, intermediate, domains=r.domains or [])
+    _job_ctl.check_cancel()
     if r.crops:
         run_crop_normalizer(intermediate, output_path, r.crops)
     else:

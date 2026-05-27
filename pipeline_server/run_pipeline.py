@@ -41,6 +41,12 @@ import textwrap
 from pathlib import Path
 from datetime import datetime
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
+except ImportError:
+    pass
+
 SCRIPT_DIR   = Path(__file__).resolve().parent       # kcc_faq/
 PIPELINE_DIR = SCRIPT_DIR / 'pipeline'               # kcc_faq/pipeline/
 
@@ -373,7 +379,7 @@ def parse_args():
     # ── Model ─────────────────────────────────────────────────────────────────
     mdl = parser.add_argument_group('Model / API')
     mdl.add_argument('--model',
-                     default='google/gemma-4-26B-A4B-it',
+                     default=os.environ.get('LLM_MODEL', 'google/gemma-4-26B-A4B-it'),
                      help='Model name/path for LLM evaluation and repair')
     mdl.add_argument('--api-key', default=None,
                      help='Anthropic API key for Claude Haiku unique-question stage. '

@@ -28,9 +28,16 @@ import sys as _sys
 _sys.path.insert(0, str(SCRIPT_DIR))
 from hyperparameter_tuning import ClusteringResult, ClusteringConfig  # noqa: F401
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
+except ImportError:
+    pass
 
-_API_URL   = os.environ.get("GEMMA_API_URL", "http://100.100.108.44:8013/v1/chat/completions")
-_API_MODEL = "google/gemma-4-26B-A4B-it"
+_API_URL            = os.environ.get("LLM_API_URL",   "http://100.100.108.44:8013/v1/chat/completions")
+_API_MODEL          = os.environ.get("LLM_MODEL",     "google/gemma-4-26B-A4B-it")
+_API_KEY            = os.environ.get("LLM_API_KEY",   "")
+_DISABLE_THINKING   = os.environ.get("LLM_DISABLE_THINKING", "").lower() == "true"
 _SYSTEM_PROMPT = (
     "You are an agricultural question clustering expert. "
     "Answer ONLY with the single letter shown (A, B, or C). "
@@ -56,6 +63,8 @@ class LocalHFJudge:
         self.device      = f"cuda:{gpu_id}"
         self._session    = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
+        if _API_KEY:
+            self._session.headers.update({"Authorization": f"Bearer {_API_KEY}"})
         print(f"Using remote LLM: {self.model_name} @ {_API_URL}")
 
         ans = self._generate_one(
@@ -67,31 +76,42 @@ class LocalHFJudge:
     # Core generation
     # ------------------------------------------------------------------
 
-    def _call_api(self, user_text: str, max_tokens: int = 10,
+    def _call_api(self, user_text: str, max_tokens: int = 300,
                   system_prompt: str = _SYSTEM_PROMPT) -> str:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_text})
         payload = {
             "model": self.model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_text},
-            ],
+            "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0,
+            **( {"thinking": {"type": "disabled"}} if _DISABLE_THINKING else {} ),
         }
-        resp = self._session.post(_API_URL, json=payload, timeout=120)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        for attempt in range(3):
+            try:
+                resp = self._session.post(_API_URL, json=payload, timeout=120)
+                resp.raise_for_status()
+                msg = resp.json()["choices"][0]["message"]
+                text = msg.get("content") or msg.get("reasoning") or msg.get("reasoning_content") or ""
+                return text.strip()
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                import time
+                time.sleep(5 * (attempt + 1))
 
     def _generate_one(self, user_text: str) -> str:
-        return self._call_api(user_text, max_tokens=10)
+        return self._call_api(user_text, max_tokens=300)
 
     def _generate_batch(self, user_texts: list[str]) -> list[str]:
         with ThreadPoolExecutor(max_workers=min(len(user_texts), 16)) as pool:
-            futures = [pool.submit(self._call_api, t, 10) for t in user_texts]
+            futures = [pool.submit(self._call_api, t, 20) for t in user_texts]
             return [f.result() for f in futures]
 
     def _gen_long(self, user_text: str, max_new_tokens: int = 300) -> str:
-        return self._call_api(user_text, max_tokens=max_new_tokens, system_prompt=_JSON_SYSTEM_PROMPT)
+        return self._call_api(user_text, max_tokens=max_new_tokens, system_prompt="")
 
     @staticmethod
     def _parse_abc(raw: str, default: str = "C") -> str:
@@ -128,7 +148,8 @@ class LocalHFJudge:
     def evaluate_separation_batch(self, cluster_pairs: list[tuple]) -> list[float]:
         """
         A=DIFFERENT(1.0)  B=SOMEWHAT(0.6)  C=SAME(0.0)
-        Should two clusters be kept in separate groups?
+        Would an agricultural officer give different practical advice for the two groups?
+        Advice-level framing avoids topic-level collapse on single-crop datasets.
         """
         score_map = {"A": 1.0, "B": 0.6, "C": 0.0}
         prompts = []
@@ -136,11 +157,13 @@ class LocalHFJudge:
             a_str = "\n".join(f"  A{i+1}. {q}" for i, q in enumerate(qa[:3]))
             b_str = "\n".join(f"  B{i+1}. {q}" for i, q in enumerate(qb[:3]))
             prompts.append(
-                f"Should these two groups of farmer questions belong in DIFFERENT clusters?\n\n"
+                f"An agricultural extension officer is answering farmer questions.\n\n"
                 f"Group A:\n{a_str}\n\nGroup B:\n{b_str}\n\n"
-                f"A) YES — clearly different agricultural topics\n"
-                f"B) SOMEWHAT — related but distinct enough to stay separate\n"
-                f"C) NO — essentially the same topic, should be merged\n\n"
+                f"Would the officer give DIFFERENT specific practical advice "
+                f"(different chemical, dose, method, or timing) for Group A vs Group B?\n\n"
+                f"A) YES — clearly different recommendations needed\n"
+                f"B) SOMEWHAT — similar advice but with meaningful differences\n"
+                f"C) NO — same recommendation covers both groups\n\n"
                 f"Answer (A/B/C):"
             )
         responses = self._generate_batch(prompts)
@@ -169,10 +192,9 @@ class LocalHFJudge:
     def detect_outliers_batch(self, clusters_queries: list[list[str]]) -> list[int]:
         """
         Returns 0-based index of the outlier question, or -1 if none.
-        Uses a 1/2/3/4/5/N prompt.
+        Uses a 1/2/3/4/5/N prompt. Clusters are evaluated concurrently.
         """
-        outlier_indices = []
-        for queries in clusters_queries:
+        def _eval_one(queries):
             n    = min(len(queries), 5)
             qs   = queries[:n]
             qstr = "\n".join(f"{i+1}. {q}" for i, q in enumerate(qs))
@@ -186,17 +208,16 @@ class LocalHFJudge:
                 f"Answer ({'/'.join([str(i+1) for i in range(n)])}/N):"
             )
             raw = self._generate_one(prompt)
-            # Parse: look for a digit 1-n or 'N'
-            found = -1
             for ch in raw.upper():
                 if ch == "N":
-                    found = -1
-                    break
+                    return -1
                 if ch.isdigit() and 1 <= int(ch) <= n:
-                    found = int(ch) - 1
-                    break
-            outlier_indices.append(found)
-        return outlier_indices
+                    return int(ch) - 1
+            return -1
+
+        with ThreadPoolExecutor(max_workers=min(len(clusters_queries), 16)) as pool:
+            futures = [pool.submit(_eval_one, q) for q in clusters_queries]
+            return [f.result() for f in futures]
 
 
 # ------------------------------------------------------------------

@@ -48,7 +48,26 @@ SCRIPT_DIR   = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(SCRIPT_DIR.parents[1] / ".env", override=True)
+except ImportError:
+    pass
+
 from cluster_repair import RepairJudge  # reuse for local mode + cross-cluster dedup
+
+# ── Model-profile env vars (set in .env; see profiles in README/.env) ────────
+_GROUPING_STRICTNESS      = os.environ.get("LLM_GROUPING_STRICTNESS", "strict")
+_CLUSTER_DEDUP_THRESH     = float(os.environ.get("LLM_CLUSTER_DEDUP_THRESH", "0.85"))
+_CROSS_BATCH_MERGE_THRESH = float(os.environ.get("LLM_CROSS_BATCH_MERGE_THRESH", "0.88"))
+
+_GROUPING_CRITERIA = (
+    "every question in a group would receive the EXACT SAME specific agricultural advice "
+    "— same chemical, same dose, same method, same timing"
+    if _GROUPING_STRICTNESS == "strict" else
+    "every question in a group would receive SUBSTANTIALLY THE SAME practical agricultural "
+    "advice — same general recommendation even if minor details like exact dose differ"
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -62,8 +81,7 @@ def build_grouping_prompt(questions: list, label: str, crop: str) -> str:
         f"You are an agricultural extension officer for {crop}.\n"
         f"Cluster topic: \"{label}\"\n\n"
         f"Below are {n} farmer questions, all about the same general topic.\n"
-        f"Group them so that every question in a group would receive the EXACT SAME "
-        f"specific agricultural advice — same chemical, same dose, same method, same timing.\n\n"
+        f"Group them so that {_GROUPING_CRITERIA}.\n\n"
         f"Rules:\n"
         f"- Same practical recommendation → same group (even if worded differently)\n"
         f"- Different chemical / dose / timing / method / plant part → different group\n"
@@ -101,14 +119,15 @@ def parse_groups(raw: str, n: int, label: str) -> list:
             except (ValueError, TypeError):
                 continue
         if idxs:
-            result.append({
-                "answer_label": str(g.get("label", ""))[:200].strip(),
-                "indices":      idxs,
-            })
+            # Use cluster label as fallback when the model returns empty or "(unclassified)"
+            raw_lbl = str(g.get("label", ""))[:200].strip()
+            if not raw_lbl or raw_lbl == "(unclassified)":
+                raw_lbl = label
+            result.append({"answer_label": raw_lbl, "indices": idxs})
 
-    for i in range(n):   # fallback: missed indices → singleton
+    for i in range(n):   # fallback: missed indices → use cluster label, not "(unclassified)"
         if i not in seen:
-            result.append({"answer_label": "(unclassified)", "indices": [i]})
+            result.append({"answer_label": label, "indices": [i]})
 
     return result or [{"answer_label": label, "indices": list(range(n))}]
 
@@ -177,8 +196,7 @@ class ClaudeBatchJudge:
                 n_ok += 1
             else:
                 print(f"  ⚠ {result.custom_id}: {result.result.type}")
-                groups = [{"answer_label": "(unclassified)",
-                           "indices": [i]} for i in range(len(questions))]
+                groups = [{"answer_label": label, "indices": list(range(len(questions)))}]
                 n_err += 1
             checkpoint[cid_key] = groups
 
@@ -199,7 +217,9 @@ class ClaudeBatchJudge:
 # ══════════════════════════════════════════════════════════════════════════════
 
 LOCAL_BATCH = 15       # gemma-4-26B-A4B-it: thinking is optional (not always-on); 15 gives good grouping
-CLUSTER_WORKERS = 4   # keep concurrent clusters low to avoid overwhelming the remote vLLM server
+CLUSTER_WORKERS   = int(os.environ.get("LLM_CLUSTER_WORKERS", "8"))
+BATCH_WORKERS     = int(os.environ.get("LLM_BATCH_WORKERS", "1"))
+CKPT_WRITE_EVERY  = 20  # flush checkpoint to disk every N cluster completions
 _ckpt_lock = threading.Lock()
 _embed_lock = threading.Lock()  # SentenceTransformer GPU model isn't thread-safe
 
@@ -239,7 +259,7 @@ def find_unique_questions_local(judge, questions, label, crop):
             batch, offset = batch_offset
             return offset, _run_local_batch(judge, batch, label, crop)
 
-        n_workers = min(len(batches), 16)
+        n_workers = min(len(batches), BATCH_WORKERS)
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             batch_results = sorted(
                 ex.map(_call, zip(batches, offsets)),
@@ -266,11 +286,11 @@ def find_unique_questions_local(judge, questions, label, crop):
     for i in range(n):
         if i not in seen:
             result.append({"group_id": len(result)+1,
-                           "answer_label": "(unclassified)", "indices": [i]})
+                           "answer_label": label, "indices": [i]})
     return result
 
 
-def _merge_cross_batch(judge, groups, questions, crop, sim_thresh=0.88):
+def _merge_cross_batch(judge, groups, questions, crop, sim_thresh=_CROSS_BATCH_MERGE_THRESH):
     # Merge by embedding similarity only — no LLM pairwise check (Gemma thinking
     # tokens blow the 10-token budget, making A/B/C answers unreliable).
     if len(groups) <= 1:
@@ -298,7 +318,7 @@ def _merge_cross_batch(judge, groups, questions, crop, sim_thresh=0.88):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cross_cluster_dedup(uq_rows: list, freq_map: dict,
-                        sim_thresh: float = 0.92, gpu_id: int = 0) -> list:
+                        sim_thresh: float = _CLUSTER_DEDUP_THRESH, gpu_id: int = 0) -> list:
     """
     Merge rows from DIFFERENT clusters if their representative questions are
     near-identical in embedding space (cosine >= sim_thresh).
@@ -368,7 +388,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--resume",     action="store_true",
                     help="Skip clusters already in checkpoint")
-    ap.add_argument("--dedup-thresh", type=float, default=0.85,
+    ap.add_argument("--dedup-thresh", type=float, default=_CLUSTER_DEDUP_THRESH,
                     help="Cosine similarity threshold for cross-cluster dedup")
     ap.add_argument("--output-dir", default=None,
                     help="Directory to write outputs (default: same dir as --cluster-file)")
@@ -447,10 +467,20 @@ def main():
                                   batch_size=args.batch_size,
                                   gpu_id=args.gpu_id)
 
+        # Pre-resolve single-question clusters (no LLM needed — mirrors anthropic path)
+        n_trivial = 0
+        for cid, grp in cluster_list:
+            cid_key = str(int(cid))
+            if cid_key not in checkpoint and len(grp) == 1:
+                label = str(grp['label'].iloc[0]).strip()
+                checkpoint[cid_key] = [{"group_id": 1, "answer_label": label, "indices": [0]}]
+                n_trivial += 1
+
         todo = [(cid, grp) for cid, grp in cluster_list
                 if str(int(cid)) not in checkpoint]
         print(f"\nProcessing {len(todo)} clusters "
-              f"({len(cluster_list)-len(todo)} already checkpointed)...\n{'='*60}")
+              f"({len(cluster_list)-len(todo)-n_trivial} already checkpointed, "
+              f"{n_trivial} single-question pre-resolved)...\n{'='*60}")
 
         # Pre-warm the SentenceTransformer model before threads start so all
         # threads share the already-loaded model and don't race on lazy-init.
@@ -462,20 +492,25 @@ def main():
             cid_key    = str(int(cid))
             questions  = grp['question'].tolist()
             label      = str(grp['label'].iloc[0]).strip()
-            if len(questions) == 1:
-                groups = [{"group_id": 1, "answer_label": label, "indices": [0]}]
-            else:
-                groups = find_unique_questions_local(
-                    judge_local, questions, label, args.crop)
+            groups = find_unique_questions_local(
+                judge_local, questions, label, args.crop)
             with _ckpt_lock:
                 checkpoint[cid_key] = groups
-                with open(ckpt_file, 'w') as f:
-                    json.dump(checkpoint, f)
 
+        completed_count = 0
         with ThreadPoolExecutor(max_workers=CLUSTER_WORKERS) as executor:
             futs = {executor.submit(_process_cluster, item): item for item in todo}
             for fut in tqdm(as_completed(futs), total=len(futs), desc="Clusters"):
                 fut.result()  # re-raise any exception
+                completed_count += 1
+                if completed_count % CKPT_WRITE_EVERY == 0:
+                    with _ckpt_lock:
+                        with open(ckpt_file, 'w') as f:
+                            json.dump(checkpoint, f)
+
+        # Final flush — ensures all completions are persisted regardless of CKPT_WRITE_EVERY
+        with open(ckpt_file, 'w') as f:
+            json.dump(checkpoint, f)
 
     # ── Build uq_rows from checkpoint ─────────────────────────────────────────
     print("\nBuilding output rows from checkpoint...")

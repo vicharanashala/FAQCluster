@@ -31,6 +31,7 @@ Usage:
 """
 
 import sys, re, json, pickle, argparse, copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -150,7 +151,7 @@ class RepairJudge(LocalHFJudge):
 
     def _gen_long(self, user_text: str, max_new_tokens: int = 300) -> str:
         """Generate a longer response (for JSON outputs) via the remote API."""
-        return self._call_api(user_text, max_tokens=max_new_tokens, system_prompt=_JSON_SYSTEM_PROMPT)
+        return self._call_api(user_text, max_tokens=max_new_tokens, system_prompt="")
 
     @staticmethod
     def _parse_json_list(raw: str) -> list:
@@ -202,7 +203,7 @@ class RepairJudge(LocalHFJudge):
             f"Integers only — no objects, no strings. "
             f'Example: {{"off": [2, 5, 7]}}. Empty list if all are about {crop}.\nJSON:'
         )
-        raw  = self._gen_long(prompt, max_new_tokens=80)
+        raw  = self._gen_long(prompt, max_new_tokens=300)
         data = self._parse_json_obj(raw)
         off  = data.get("off", [])
         safe = [_safe_int(i) for i in off]
@@ -315,30 +316,31 @@ def step_b_cross_crop(clusters: dict, judge: RepairJudge, crop: str) -> dict:
     print(f"\n{'─'*60}\nStep B: Cross-crop contamination filter\n{'─'*60}")
     total_removed = 0
 
-    for cid in tqdm(list(clusters.keys()), desc="B: cross-crop"):
-        queries = clusters[cid]['queries']
-        counts  = clusters[cid]['counts']
-        off     = judge.cross_crop_filter(queries, crop)
-        if not off:
-            continue
-
-        off_set  = set(off)
-        off_qs   = [queries[i] for i in off]
-        frac     = len(off) / len(queries)
-        print(f"  Cluster {cid}: {len(off)}/{len(queries)} off-topic ({frac*100:.0f}%)")
-        for q in off_qs[:3]:
-            print(f"    - {q[:80]}")
-
-        keep = [i for i in range(len(queries)) if i not in off_set]
-        if len(keep) >= 2:
-            clusters[cid]['queries'] = [queries[i] for i in keep]
-            clusters[cid]['counts']  = [counts[i]  for i in keep]
-            clusters[cid]['size']    = sum(clusters[cid]['counts'])
-        else:
-            # Cluster shrank to 0 or 1 query: mark for deletion
-            clusters[cid]['_delete'] = True
-
-        total_removed += len(off)
+    cids = list(clusters.keys())
+    with ThreadPoolExecutor(max_workers=min(len(cids), 16)) as pool:
+        future_to_cid = {pool.submit(judge.cross_crop_filter, clusters[cid]['queries'], crop): cid
+                         for cid in cids}
+        for future in tqdm(as_completed(future_to_cid), total=len(cids), desc="B: cross-crop"):
+            cid = future_to_cid[future]
+            off = future.result()
+            if not off:
+                continue
+            queries  = clusters[cid]['queries']
+            counts   = clusters[cid]['counts']
+            off_set  = set(off)
+            off_qs   = [queries[i] for i in off]
+            frac     = len(off) / len(queries)
+            print(f"  Cluster {cid}: {len(off)}/{len(queries)} off-topic ({frac*100:.0f}%)")
+            for q in off_qs[:3]:
+                print(f"    - {q[:80]}")
+            keep = [i for i in range(len(queries)) if i not in off_set]
+            if len(keep) >= 2:
+                clusters[cid]['queries'] = [queries[i] for i in keep]
+                clusters[cid]['counts']  = [counts[i]  for i in keep]
+                clusters[cid]['size']    = sum(clusters[cid]['counts'])
+            else:
+                clusters[cid]['_delete'] = True
+            total_removed += len(off)
 
     # Remove empty/singleton clusters
     to_del = [c for c in clusters if clusters[c].get('_delete')]
@@ -365,19 +367,33 @@ def step_c_split(clusters: dict, diverse_reps: dict, result_df: pd.DataFrame,
     max_cid = max(clusters.keys())
     n_splits = 0
 
-    for cid in tqdm(list(clusters.keys()), desc="C: coherence"):
-        reps = diverse_reps.get(cid, [])
-        if len(reps) < 2:
-            continue
-        rating = judge.coherence_diagnostic(reps, crop)
-        if rating != flag_on:
-            continue   # A or B → keep as is
+    # Phase 1: run all coherence diagnostics in parallel
+    eligible = {cid: diverse_reps[cid] for cid in clusters if len(diverse_reps.get(cid, [])) >= 2}
+    ratings  = {}
+    with ThreadPoolExecutor(max_workers=min(len(eligible), 16)) as pool:
+        future_to_cid = {pool.submit(judge.coherence_diagnostic, reps, crop): cid
+                         for cid, reps in eligible.items()}
+        for future in tqdm(as_completed(future_to_cid), total=len(eligible), desc="C: coherence"):
+            cid = future_to_cid[future]
+            ratings[cid] = future.result()
 
+    # Phase 2: run split_cluster in parallel for flagged clusters
+    to_split = {cid for cid, r in ratings.items() if r == flag_on}
+    splits   = {}
+    if to_split:
+        with ThreadPoolExecutor(max_workers=min(len(to_split), 16)) as pool:
+            future_to_cid = {pool.submit(judge.split_cluster, clusters[cid]['queries'], crop): cid
+                             for cid in to_split}
+            for future in tqdm(as_completed(future_to_cid), total=len(to_split), desc="C: split"):
+                cid = future_to_cid[future]
+                splits[cid] = future.result()
+
+    # Phase 3: apply split results (sequential — mutates clusters dict)
+    for cid, groups in splits.items():
         queries = clusters[cid]['queries']
         counts  = clusters[cid]['counts']
-        print(f"\n  Cluster {cid} ({len(queries)} Qs) rated '{rating}': {reps}")
-
-        groups = judge.split_cluster(queries, crop)
+        reps    = eligible[cid]
+        print(f"\n  Cluster {cid} ({len(queries)} Qs) rated '{ratings[cid]}': {reps}")
 
         if len(groups) <= 1:
             print("    → LLM returned a single group — no split applied")
