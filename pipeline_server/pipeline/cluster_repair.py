@@ -32,6 +32,7 @@ Usage:
 
 import sys, re, json, pickle, argparse, copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import torch
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -644,7 +645,8 @@ def run_phase1(raw_csv: Path, crop: str, grid_mode: str,
         print(f"  Sampled: {max_queries}")
 
     print(f"\nLoading sentence transformer...")
-    model      = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
+    _device = "cuda" if torch.cuda.is_available() else "cpu"
+    model      = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2', device=_device)
     stop_words = load_stopwords()
     configs    = generate_param_grid(mode=grid_mode)
 
@@ -833,7 +835,8 @@ def main():
     print(f"\n{'─'*60}\nStep A: Max-diversity representative selection\n{'─'*60}")
     from sentence_transformers import SentenceTransformer
     print("  Loading sentence transformer...")
-    st_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
+    _device = f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu"
+    st_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2', device=_device)
     texts    = result.df['query_text'].tolist()
     print(f"  Encoding {len(texts)} unique queries...")
     all_embs = st_model.encode(

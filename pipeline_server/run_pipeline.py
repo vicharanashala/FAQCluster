@@ -49,6 +49,7 @@ except ImportError:
 
 SCRIPT_DIR   = Path(__file__).resolve().parent       # kcc_faq/
 PIPELINE_DIR = SCRIPT_DIR / 'pipeline'               # kcc_faq/pipeline/
+_APP_DATA    = SCRIPT_DIR / 'app-data'               # Zoho-synced root
 
 try:
     import _job_ctl as _ctl
@@ -57,6 +58,64 @@ except ImportError:
 # Corpus config is local to this folder — no external project dependency
 DEFAULT_CORPUS = SCRIPT_DIR / 'config' / 'irrelevant_corpus.yaml'
 sys.path.insert(0, str(SCRIPT_DIR))  # so `from pipeline.X import Y` works
+
+# ── Optional Zoho WorkDrive sync ────────────────────────────────────────────
+try:
+    from helpers.zoho_workdrive import ZohoWorkDrive as _ZohoWorkDrive
+    _ZOHO_AVAILABLE = True
+except Exception:
+    _ZOHO_AVAILABLE = False
+
+
+def _z_rel(out_dir: Path):
+    """Return the Zoho-relative path for out_dir (e.g. outputs/repair/kerala/wayanad_0/coconut)."""
+    try:
+        return str(out_dir.relative_to(_APP_DATA))
+    except ValueError:
+        return None
+
+
+def _z_pull(zwd, zoho_rel: str, out_dir: Path) -> None:
+    """Download any existing intermediate files for this crop from Zoho (skip if already local)."""
+    try:
+        result = zwd.resolve_path(zoho_rel)
+        if result is None:
+            return
+        folder_id, _ = result
+        for path, item in zwd.walk_folder(folder_id, prefix=zoho_rel):
+            if item["type"] == "folder":
+                continue
+            fname = Path(path).name
+            local = out_dir / fname
+            if local.exists():
+                continue
+            try:
+                local.write_bytes(zwd.download_file(item["id"]))
+                print(f"  [ZOHO] ↓ {fname}")
+            except Exception as e:
+                print(f"  [ZOHO] download failed for {fname}: {e}")
+    except Exception as e:
+        print(f"  [ZOHO] pull failed for {zoho_rel}: {e}")
+
+
+def _z_push(zwd, zoho_rel: str, *files) -> None:
+    """Upload specific files to this crop's Zoho folder."""
+    if zwd is None or zoho_rel is None:
+        return
+    try:
+        parent_id = zwd.ensure_path(zoho_rel)
+    except Exception as e:
+        print(f"  [ZOHO] ensure_path failed for {zoho_rel}: {e}")
+        return
+    for f in files:
+        f = Path(f)
+        if not f.exists():
+            continue
+        try:
+            zwd.upload_file(f.name, f.read_bytes(), parent_id)
+            print(f"  [ZOHO] ↑ {f.name}")
+        except Exception as e:
+            print(f"  [ZOHO] upload failed for {f.name}: {e}")
 
 
 def banner(msg: str):
@@ -102,9 +161,11 @@ def run_phase1(args, out_dir: Path):
         print(f"  Sampled: {args.max_queries}")
 
     print("\n  Loading sentence transformer...")
+    import torch
+    device = f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu"
     model = SentenceTransformer(
         'sentence-transformers/paraphrase-multilingual-mpnet-base-v2',
-        device=f"cuda:{args.gpu_id}",
+        device=device,
     )
     stop_words = load_stopwords()
     configs = generate_param_grid(mode=args.grid_mode)
@@ -159,9 +220,11 @@ def run_repair(args, out_dir: Path, candidates: list, best_cfg: str):
 
     # Step A: diverse reps
     print(f"\n  [A] Loading sentence transformer for embeddings...")
+    import torch
+    device = f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu"
     st_model = SentenceTransformer(
         'sentence-transformers/paraphrase-multilingual-mpnet-base-v2',
-        device=f"cuda:{args.gpu_id}",
+        device=device,
     )
     texts    = result.df['query_text'].tolist()
     import numpy as np
@@ -463,6 +526,18 @@ def main():
     print(f"  Grid mode  : {args.grid_mode}")
     print(f"  Started    : {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
+    # ── Zoho: pull existing intermediates so stage-skipping survives restarts ──
+    _zwd = None
+    _zrel = _z_rel(out_dir)
+    if _ZOHO_AVAILABLE and _zrel:
+        try:
+            _zwd = _ZohoWorkDrive()
+            print(f"  [ZOHO] Pulling intermediates from WorkDrive: {_zrel}")
+            _z_pull(_zwd, _zrel, out_dir)
+        except Exception as _ze:
+            print(f"  [ZOHO] Init failed — running local only: {_ze}")
+            _zwd = None
+
     candidates = None  # loaded lazily — avoids heavy imports when phases 2+3 are already done
 
     # ── Stage 1: Phase 1 ─────────────────────────────────────────────────────
@@ -474,6 +549,7 @@ def main():
         # candidates loaded lazily below only if phase 2 or 3 actually runs
     else:
         candidates = run_phase1(args, out_dir)
+        _z_push(_zwd, _zrel, out_dir / 'phase1_results.pkl', out_dir / 'phase1_candidates.csv')
 
     # ── Stage 2: Phase 2 ─────────────────────────────────────────────────────
     if args.skip_phase2 or (out_dir / 'phase2_scores.csv').exists():
@@ -486,6 +562,7 @@ def main():
         if candidates is None:
             candidates = load_candidates(out_dir)
         best_cfg = run_phase2(args, out_dir, candidates)
+        _z_push(_zwd, _zrel, out_dir / 'phase2_scores.csv')
 
     # ── Stage 3: Repair ───────────────────────────────────────────────────────
     if args.skip_repair or (out_dir / 'cluster_questions.csv').exists():
@@ -497,6 +574,10 @@ def main():
         if candidates is None:
             candidates = load_candidates(out_dir)
         run_repair(args, out_dir, candidates, best_cfg)
+        _z_push(_zwd, _zrel,
+                out_dir / 'cluster_questions.csv',
+                out_dir / 'repaired_clusters.csv',
+                out_dir / 'raw_row_mapping.csv')
 
     # ── Stage 4: Unique questions ──────────────────────────────────────────────
     if args.skip_unique_q or (out_dir / 'unique_question_mapping.csv').exists():
@@ -506,6 +587,12 @@ def main():
             print("\n[--skip-unique-q] Skipping unique question extraction")
     else:
         run_unique_questions(args, out_dir)
+        _z_push(_zwd, _zrel,
+                out_dir / 'unique_questions.csv',
+                out_dir / 'unique_question_mapping.csv',
+                out_dir / 'unique_questions_checkpoint.json',
+                out_dir / 'unique_questions_freq.csv',
+                out_dir / 'unique_questions_verification.csv')
 
     # ── Stage 5: Dedup ────────────────────────────────────────────────────────
     # Skip if a downstream stage already ran — corpus filter and Q&A gen both follow dedup,
@@ -515,6 +602,7 @@ def main():
         print(f"\n[auto-skip] downstream output exists — dedup (Stage 5) already ran")
     else:
         run_dedup(out_dir)
+        _z_push(_zwd, _zrel, out_dir / 'unique_questions_freq.csv')
 
     # ── Stage 6: Corpus filter ────────────────────────────────────────────────
     if args.skip_corpus_filter or (out_dir / 'corpus_filtered_out.csv').exists():
@@ -529,6 +617,9 @@ def main():
         else:
             run_corpus_filter(out_dir, args.corpus_file, args.fuzz_threshold,
                               crop=args.crop, crops_yaml=args.crops_file)
+            _z_push(_zwd, _zrel,
+                    out_dir / 'corpus_filtered_out.csv',
+                    out_dir / 'unique_questions_freq.csv')
 
     # ── Stage 7: Q&A Generation ───────────────────────────────────────────────
     if args.skip_qa_gen or (out_dir / 'unique_questions_freq_qa.csv').exists():
@@ -538,12 +629,14 @@ def main():
             print("\n[--skip-qa-gen] Skipping Q&A generation")
     else:
         run_qa_gen(args, out_dir)
+        _z_push(_zwd, _zrel, out_dir / 'unique_questions_freq_qa.csv')
 
     # ── Done ──────────────────────────────────────────────────────────────────
     import json as _json
     _meta_path = out_dir / "meta.json"
     if not _meta_path.exists():
         _meta_path.write_text(_json.dumps({"download": False, "audit": False}))
+    _z_push(_zwd, _zrel, _meta_path)
 
     elapsed = datetime.now() - start_time
     banner("Pipeline Complete!")

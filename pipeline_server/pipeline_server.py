@@ -21,9 +21,9 @@ Routes:
   POST /files/folders             create directory
   POST /files/upload-audited      upload audited CSV
 
-  GET  /app/next-state            get next versioned state folder name
-  GET  /app/state-table           table of all state/crop outputs
-  GET  /app/output/{state}/{crop} download output CSV
+  GET  /app/next-state                        get next versioned district folder name
+  GET  /app/state-table                       table of all state/district/crop outputs
+  GET  /app/output/{state}/{district}/{crop}  download output CSV
 
   GET  /jobs                      list all jobs
   GET  /jobs/{job_id}             get job details
@@ -44,9 +44,10 @@ import threading
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Iterator, List, Optional
 
 try:
     from dotenv import load_dotenv
@@ -56,7 +57,7 @@ except ImportError:
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, field_validator, model_validator
 
 import _job_ctl
@@ -65,9 +66,116 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 APP_DATA = SCRIPT_DIR / "app-data"
-APP_DATA.mkdir(exist_ok=True)
-(APP_DATA / "outputs" / "repair").mkdir(parents=True, exist_ok=True)
-(APP_DATA / "outputs" / "hyperparameter_tuning").mkdir(parents=True, exist_ok=True)
+APP_DATA.mkdir(exist_ok=True)  # local scratch only — persistent data lives in Zoho WorkDrive
+
+# ── Zoho WorkDrive integration ────────────────────────────────────────────────
+
+_zoho_instance = None
+_zoho_init_lock = threading.Lock()
+
+
+def _get_zoho():
+    global _zoho_instance
+    if _zoho_instance is None:
+        with _zoho_init_lock:
+            if _zoho_instance is None:
+                from helpers.zoho_workdrive import ZohoWorkDrive
+                _zoho_instance = ZohoWorkDrive()
+    return _zoho_instance
+
+
+def _zoho_sync_down(rel_path: str) -> bool:
+    """Download a file from Zoho to APP_DATA/<rel_path>. Returns True if found."""
+    try:
+        zwd = _get_zoho()
+        result = zwd.resolve_path(rel_path)
+        if result is None:
+            return False
+        file_id, ftype = result
+        if ftype == "folder":
+            return False
+        local = APP_DATA / rel_path
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(zwd.download_file(file_id))
+        print(f"[ZOHO] Downloaded {rel_path}")
+        return True
+    except Exception as e:
+        print(f"[ZOHO] sync_down failed for {rel_path}: {e}")
+        return False
+
+
+def _zoho_sync_up(local_path: Path) -> Optional[str]:
+    """Upload a local file to Zoho at the same relative path under root. Returns file ID."""
+    if not local_path.exists():
+        return None
+    try:
+        rel = local_path.relative_to(APP_DATA)
+        parts = rel.parts
+        zoho_folder = "/".join(parts[:-1]) if len(parts) > 1 else ""
+        zwd = _get_zoho()
+        parent_id = zwd.ensure_path(zoho_folder) if zoho_folder else zwd.root_folder_id
+        fid = zwd.upload_file(local_path.name, local_path.read_bytes(), parent_id)
+        print(f"[ZOHO] Uploaded {rel}")
+        return fid
+    except Exception as e:
+        print(f"[ZOHO] sync_up failed for {local_path}: {e}")
+        return None
+
+
+def _zoho_sync_up_dir(local_dir: Path) -> None:
+    """Upload all files in a local directory tree to Zoho."""
+    if not local_dir.exists():
+        return
+    for f in sorted(local_dir.rglob("*")):
+        if f.is_file():
+            _zoho_sync_up(f)
+
+
+@contextmanager
+def _stream_zoho_to_tmp(zoho_path: str) -> Iterator[Path]:
+    """Stream a Zoho file into a NamedTemporaryFile and yield its path. Auto-deleted on exit."""
+    zwd = _get_zoho()
+    result = zwd.resolve_path(zoho_path)
+    if result is None:
+        raise FileNotFoundError(f"{zoho_path!r} not found in Zoho WorkDrive")
+    file_id = result[0]
+    resp = zwd.download_file_stream(file_id)
+    with tempfile.NamedTemporaryFile(suffix=".csv", dir="/tmp", delete=True) as tmp:
+        try:
+            for chunk in resp.iter_content(chunk_size=4 << 20):
+                tmp.write(chunk)
+            tmp.flush()
+        finally:
+            resp.close()
+        print(f"[ZOHO] Streamed {zoho_path} → /tmp ({Path(tmp.name).stat().st_size >> 20} MB)")
+        yield Path(tmp.name)
+    # NamedTemporaryFile auto-deletes here
+
+
+def _zoho_walk_down(zoho_path: str, local_base: Path) -> None:
+    """Recursively download all files under a Zoho path into local_base."""
+    try:
+        zwd = _get_zoho()
+        result = zwd.resolve_path(zoho_path)
+        if result is None:
+            return
+        folder_id, ftype = result
+        if ftype != "folder":
+            return
+        for path, item in zwd.walk_folder(folder_id, prefix=zoho_path):
+            if item["type"] == "folder":
+                continue
+            local_dest = local_base / path
+            if local_dest.exists():
+                continue
+            try:
+                content = zwd.download_file(item["id"])
+                local_dest.parent.mkdir(parents=True, exist_ok=True)
+                local_dest.write_bytes(content)
+            except Exception as e:
+                print(f"[ZOHO] walk_down failed for {path}: {e}")
+    except Exception as e:
+        print(f"[ZOHO] walk_down failed for {zoho_path}: {e}")
 
 _CHUNK_TMP = Path(tempfile.gettempdir()) / "faq_chunks"
 _RUN_PIPELINE = SCRIPT_DIR / "run_pipeline.py"
@@ -80,6 +188,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Return 503 instead of crashing when Zoho WorkDrive is unreachable or rate-limits us
+import requests as _requests
+
+@app.exception_handler(_requests.exceptions.RetryError)
+@app.exception_handler(_requests.exceptions.ConnectionError)
+async def zoho_unavailable_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"Zoho WorkDrive unavailable: {exc}"},
+    )
 
 # ---------------------------------------------------------------------------
 # Path safety helpers
@@ -230,6 +350,7 @@ def slug(name: str) -> str:
 
 class PreRequest(BaseModel):
     state: str
+    district: Optional[str] = None
     crops: Optional[List[str]] = None
     domains: Optional[List[str]] = None
     output: str
@@ -249,6 +370,7 @@ class PreRequest(BaseModel):
 
 
 class PipelineRequest(BaseModel):
+    state: Optional[str] = None
     input: str = "cleaned_data.csv"
     crops: Optional[List[str]] = None
     domains: Optional[List[str]] = None
@@ -286,6 +408,7 @@ class PostRequest(BaseModel):
 
 class FullRequest(BaseModel):
     state: str
+    district: Optional[str] = None
     crops: Optional[List[str]] = None
     crops_file: Optional[str] = None
     domains: Optional[List[str]] = None
@@ -325,32 +448,51 @@ class RenameRequest(BaseModel):
 def _run_pre_sync(r: PreRequest) -> None:
     from run_pre_pipeline import run_state_filter, run_crop_normalizer
 
-    input_path  = APP_DATA / "cleaned_data.csv"
     output_path = _resolve_safe(r.output)
-
-    if not input_path.exists():
-        raise FileNotFoundError(f"input file not found: {input_path}")
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
     intermediate = output_path.parent / f"{output_path.stem}_state_rows.csv"
 
-    run_state_filter(input_path, r.state, intermediate, domains=r.domains or [])
-    _job_ctl.check_cancel()
-    if r.crops:
-        run_crop_normalizer(intermediate, output_path, r.crops)
-    else:
-        shutil.copy2(intermediate, output_path)
+    print("[ZOHO] Streaming cleaned_data.csv from WorkDrive...")
+    with _stream_zoho_to_tmp("cleaned_data.csv") as input_path:
+        run_state_filter(input_path, r.state, intermediate, domains=r.domains or [], district=r.district)
+        _job_ctl.check_cancel()
+        if r.crops:
+            run_crop_normalizer(intermediate, output_path, r.crops)
+        else:
+            shutil.copy2(intermediate, output_path)
 
     if intermediate.exists() and not r.keep_intermediate:
         intermediate.unlink()
+
+    _zoho_sync_up(output_path)
+    meta_path = output_path.parent / "meta.json"
+    if meta_path.exists():
+        _zoho_sync_up(meta_path)
 
 
 def _run_pipeline_sync(r: PipelineRequest) -> None:
     import pandas as pd
 
-    resolved_raw = str(APP_DATA / r.input)
-    state_folder = Path(r.input).stem
-    out_base     = _resolve_safe(r.output_dir) / state_folder
+    # Ensure input CSV is present locally (download from Zoho if needed)
+    local_input = APP_DATA / r.input
+    if not local_input.exists():
+        print(f"[ZOHO] {r.input} not local — downloading from WorkDrive...")
+        if not _zoho_sync_down(r.input):
+            raise FileNotFoundError(f"Input file not found locally or in Zoho: {r.input}")
+
+    resolved_raw  = str(APP_DATA / r.input)
+    input_parts   = Path(r.input).parts
+    district_folder = Path(r.input).stem  # e.g. "bengaluru_0" from "karnataka/bengaluru_0/bengaluru_0.csv"
+
+    # Derive state slug: explicit field > first component of a 3-part path > fallback
+    if r.state:
+        state_slug = slug(r.state)
+    elif len(input_parts) >= 3:
+        state_slug = input_parts[0]
+    else:
+        state_slug = district_folder  # backward-compat for flat paths
+
+    out_base     = _resolve_safe(r.output_dir) / state_slug / district_folder
     failed       = []
 
     if r.crops or r.domains:
@@ -367,11 +509,18 @@ def _run_pipeline_sync(r: PipelineRequest) -> None:
         crops = _df["Crop"].dropna().str.strip().unique().tolist()
         print(f"[INFO] Found {len(crops)} unique crop(s): {', '.join(crops)}")
 
-    out_dir_str = str(_resolve_safe(r.output_dir))
+    # Pass repair/state_slug as --output-dir so run_pipeline.py puts outputs at
+    # repair/state_slug/district_folder/crop_slug (run_pipeline appends stem + crop_slug)
+    out_dir_str = str(_resolve_safe(r.output_dir) / state_slug)
 
     for crop in crops:
         _job_ctl.check_cancel()
-        (out_base / slug(crop)).mkdir(parents=True, exist_ok=True)
+        crop_out = out_base / slug(crop)
+        crop_out.mkdir(parents=True, exist_ok=True)
+
+        # Pull any existing intermediates from Zoho so stage-skipping survives restarts
+        _zoho_walk_down(f"outputs/repair/{state_slug}/{district_folder}/{slug(crop)}", APP_DATA)
+
         print(f"[INFO] Starting pipeline for '{crop}'...")
 
         cmd = [
@@ -415,6 +564,11 @@ def _run_pipeline_sync(r: PipelineRequest) -> None:
         if rc != 0:
             print(f"[WARN] Crop '{crop}' failed (returncode={rc})")
             failed.append(crop)
+        else:
+            # Upload any outputs not already pushed by run_pipeline.py per-stage
+            _zoho_sync_up_dir(crop_out)
+            shutil.rmtree(crop_out, ignore_errors=True)
+            print(f"[INFO] Cleaned up local folder: {crop_out.relative_to(APP_DATA)}")
 
     if failed:
         raise RuntimeError(f"The following crops failed: {', '.join(failed)}")
@@ -424,21 +578,38 @@ def _run_post_sync(r: PostRequest) -> None:
     from run_post_pipeline import run_dedup as post_run_dedup
 
     input_dir = _resolve_safe(r.input)
+
+    # Download the repair folder from Zoho if not present locally
     if not input_dir.exists():
-        raise FileNotFoundError(f"input folder not found: {input_dir}")
+        print(f"[ZOHO] {r.input} not local — downloading from WorkDrive...")
+        _zoho_walk_down(r.input, APP_DATA)
+
+    if not input_dir.exists():
+        raise FileNotFoundError(f"input folder not found locally or in Zoho: {input_dir}")
 
     if not r.skip_dedup:
         post_run_dedup(input_dir, r.crops or None)
 
+    print("[ZOHO] Uploading post-pipeline outputs to WorkDrive...")
+    _zoho_sync_up_dir(input_dir)
 
-def _next_versioned_path(current_path: Path) -> Path:
-    """Return the next non-existent versioned path, e.g. maharashtra_1.csv → maharashtra_2.csv."""
+
+def _next_versioned_path(current_path: Path, zwd=None) -> Path:
+    """Return the next non-existent versioned path, checking Zoho (authoritative) if zwd given."""
     m = re.match(r"^(.+)_(\d+)$", current_path.stem)
     base, ver = (m.group(1), int(m.group(2))) if m else (current_path.stem, 0)
     next_ver = ver + 1
     while True:
         candidate = current_path.parent / f"{base}_{next_ver}{current_path.suffix}"
-        if not candidate.exists():
+        if zwd is not None:
+            try:
+                rel = str(candidate.relative_to(APP_DATA))
+                exists = zwd.resolve_path(rel) is not None
+            except ValueError:
+                exists = False
+        else:
+            exists = candidate.exists()
+        if not exists:
             return candidate
         next_ver += 1
 
@@ -453,7 +624,9 @@ def _run_full_sync(r: FullRequest) -> None:
     elif r.crops_file:
         crops_file = _resolve_safe(r.crops_file)
         if not crops_file.exists():
-            raise FileNotFoundError(f"crops file not found: {crops_file}")
+            _zoho_sync_down(r.crops_file)
+        if not crops_file.exists():
+            raise FileNotFoundError(f"crops file not found locally or in Zoho: {crops_file}")
         lines = crops_file.read_text().splitlines()
         crops = [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
         if not crops:
@@ -463,8 +636,14 @@ def _run_full_sync(r: FullRequest) -> None:
 
     _norm_is_temp = False
 
+    state_slug = slug(r.state)
+
     if r.skip_pre_pipeline:
-        effective_raw = str(APP_DATA / "cleaned_data.csv")
+        # Needed for the full duration (passed to per-crop subprocesses as --raw-file)
+        print("[ZOHO] Streaming cleaned_data.csv from WorkDrive...")
+        _cleaned_ctx = _stream_zoho_to_tmp("cleaned_data.csv")
+        _cleaned_tmp = _cleaned_ctx.__enter__()
+        effective_raw = str(_cleaned_tmp)
         if crops is None:
             _df = pd.read_csv(effective_raw, low_memory=False)
             if r.domains:
@@ -472,121 +651,181 @@ def _run_full_sync(r: FullRequest) -> None:
             crops = _df["Crop"].dropna().str.strip().unique().tolist()
             print(f"[INFO] Auto-discovered {len(crops)} crop(s) from input CSV")
     else:
-        raw_file = APP_DATA / "cleaned_data.csv"
-        if r.pre_output:
-            norm_file = _resolve_safe(r.pre_output)
-            norm_file.parent.mkdir(parents=True, exist_ok=True)
-            _norm_is_temp = False
+        # ── Pre-check: read Zoho meta BEFORE streaming the 4 GB cleaned_data.csv ──
+        # Zoho is authoritative — fetch state/district/meta.json first so we only
+        # download cleaned_data.csv when we actually need to run the pre-pipeline.
+        _zwd_pre = _get_zoho()
+        existing_meta: dict = {}
+        _pre_can_reuse_fully = False
+        pre_rel = r.pre_output  # may be None
+        file_exists = same_state = same_district = same_domains = False
+        existing_crops_meta: set = set()
 
-            meta_path = norm_file.parent / "meta.json"
-            existing_meta: dict = {}
-            for _mp in (meta_path, norm_file.with_suffix(".json")):
-                if _mp.exists():
-                    try:
-                        existing_meta = json.loads(_mp.read_text())
-                        break
-                    except Exception:
-                        pass
+        if r.pre_output:
+            _meta_zoho = _zwd_pre.resolve_path(str(Path(pre_rel).parent / "meta.json"))
+            if _meta_zoho:
+                try:
+                    existing_meta = json.loads(_zwd_pre.download_file(_meta_zoho[0]))
+                except Exception:
+                    pass
 
             existing_domains    = set(existing_meta.get("domains", []))
             existing_crops_meta = set(existing_meta.get("crops", []))
             requested_domains   = set(r.domains or [])
-            file_exists         = norm_file.exists() and bool(existing_meta)
+            file_exists         = _zwd_pre.resolve_path(pre_rel) is not None and bool(existing_meta)
             same_state          = existing_meta.get("state") == r.state if existing_meta else False
+            same_district       = existing_meta.get("district", "") == (r.district or "") if existing_meta else False
             same_domains        = existing_domains == requested_domains
 
-            if file_exists and same_state and same_domains:
-                if crops is None:
-                    print(f"[INFO] Reusing existing pre-pipeline output: {norm_file}")
-                    crops = pd.read_csv(norm_file)["Crop"].dropna().str.strip().unique().tolist()
-                    print(f"[INFO] {len(crops)} crop(s) from cached pre-pipeline output")
-                else:
-                    missing_crops = [c for c in crops if c not in existing_crops_meta]
-                    if not missing_crops:
-                        print(f"[INFO] Reusing existing pre-pipeline output: {norm_file}")
+            if file_exists and same_state and same_district and same_domains:
+                missing = [c for c in (crops or []) if c not in existing_crops_meta]
+                if crops is None or not missing:
+                    _pre_can_reuse_fully = True
+                    print(f"[INFO] Pre-pipeline output found in Zoho — skipping cleaned_data.csv download")
+
+        if _pre_can_reuse_fully:
+            # All required crops already processed — just pull the small pre-pipeline CSV
+            norm_file = _resolve_safe(pre_rel)
+            norm_file.parent.mkdir(parents=True, exist_ok=True)
+            _norm_is_temp = False
+            meta_path = norm_file.parent / "meta.json"
+            if not norm_file.exists():
+                _zoho_sync_down(pre_rel)
+            if crops is None:
+                crops = pd.read_csv(norm_file)["Crop"].dropna().str.strip().unique().tolist()
+                print(f"[INFO] {len(crops)} crop(s) from cached pre-pipeline output (Zoho)")
+            else:
+                print(f"[INFO] Reusing pre-pipeline output: {pre_rel} (from Zoho)")
+            effective_raw = str(norm_file)
+        else:
+            # Need to (partially) re-run pre-pipeline — stream cleaned_data.csv now
+            print("[ZOHO] Streaming cleaned_data.csv from WorkDrive...")
+            with _stream_zoho_to_tmp("cleaned_data.csv") as raw_file:
+                if r.pre_output:
+                    norm_file = _resolve_safe(r.pre_output)
+                    norm_file.parent.mkdir(parents=True, exist_ok=True)
+                    _norm_is_temp = False
+
+                    meta_path = norm_file.parent / "meta.json"
+
+                    # Reuse already-fetched metadata from the pre-check above
+                    if file_exists and same_state and same_district and same_domains:
+                        if crops is None:
+                            print(f"[INFO] Reusing existing pre-pipeline output: {pre_rel} (from Zoho)")
+                            if not norm_file.exists():
+                                _zoho_sync_down(pre_rel)
+                            crops = pd.read_csv(norm_file)["Crop"].dropna().str.strip().unique().tolist()
+                            print(f"[INFO] {len(crops)} crop(s) from cached pre-pipeline output")
+                        else:
+                            missing_crops = [c for c in crops if c not in existing_crops_meta]
+                            if not missing_crops:
+                                print(f"[INFO] Reusing existing pre-pipeline output: {pre_rel} (from Zoho)")
+                                if not norm_file.exists():
+                                    _zoho_sync_down(pre_rel)
+                            else:
+                                print(
+                                    f"[INFO] {len(crops) - len(missing_crops)} crop(s) reused; "
+                                    f"running pre-pipeline for {len(missing_crops)} new crop(s): {', '.join(missing_crops)}"
+                                )
+                                if not norm_file.exists():
+                                    _zoho_sync_down(pre_rel)
+                                intermediate = norm_file.parent / f"{norm_file.stem}_state_rows.csv"
+                                run_state_filter(raw_file, r.state, intermediate,
+                                                 domains=r.domains or [], district=r.district)
+                                fd2, tmp2 = tempfile.mkstemp(suffix="_extra.csv", dir=str(norm_file.parent))
+                                os.close(fd2)
+                                tmp2_path = Path(tmp2)
+                                try:
+                                    run_crop_normalizer(intermediate, tmp2_path, missing_crops)
+                                    _df_extra = pd.read_csv(tmp2_path, low_memory=False)
+                                    if "domain" not in _df_extra.columns and "QueryType" in _df_extra.columns:
+                                        _df_extra.insert(12, "domain", _df_extra["QueryType"])
+                                    _df_existing = pd.read_csv(norm_file, low_memory=False)
+                                    pd.concat([_df_existing, _df_extra], ignore_index=True).to_csv(norm_file, index=False)
+                                    print(f"[INFO] Appended {len(missing_crops)} new crop(s) to {norm_file}")
+                                finally:
+                                    if tmp2_path.exists():
+                                        tmp2_path.unlink()
+                                if intermediate.exists():
+                                    intermediate.unlink()
+                                meta_path.write_text(json.dumps({
+                                    "state": r.state,
+                                    "district": r.district or "",
+                                    "domains": r.domains or [],
+                                    "crops": sorted(existing_crops_meta | set(missing_crops)),
+                                }))
                     else:
-                        print(
-                            f"[INFO] {len(crops) - len(missing_crops)} crop(s) reused; "
-                            f"running pre-pipeline for {len(missing_crops)} new crop(s): {', '.join(missing_crops)}"
-                        )
+                        if file_exists:
+                            norm_file = _next_versioned_path(norm_file, _zwd_pre)
+                            norm_file.parent.mkdir(parents=True, exist_ok=True)
+                            meta_path = norm_file.parent / "meta.json"
+                            print(f"[INFO] Domain/state/district change — new pre-pipeline output: {norm_file}")
+
                         intermediate = norm_file.parent / f"{norm_file.stem}_state_rows.csv"
-                        run_state_filter(raw_file, r.state, intermediate, domains=r.domains or [])
-                        fd2, tmp2 = tempfile.mkstemp(suffix="_extra.csv", dir=str(norm_file.parent))
-                        os.close(fd2)
-                        tmp2_path = Path(tmp2)
-                        try:
-                            run_crop_normalizer(intermediate, tmp2_path, missing_crops)
-                            _df_extra = pd.read_csv(tmp2_path, low_memory=False)
-                            if "domain" not in _df_extra.columns and "QueryType" in _df_extra.columns:
-                                _df_extra.insert(12, "domain", _df_extra["QueryType"])
-                            _df_existing = pd.read_csv(norm_file, low_memory=False)
-                            pd.concat([_df_existing, _df_extra], ignore_index=True).to_csv(norm_file, index=False)
-                            print(f"[INFO] Appended {len(missing_crops)} new crop(s) to {norm_file}")
-                        finally:
-                            if tmp2_path.exists():
-                                tmp2_path.unlink()
+                        run_state_filter(raw_file, r.state, intermediate,
+                                         domains=r.domains or [], district=r.district)
+                        if crops is None:
+                            run_crop_normalizer(intermediate, norm_file)
+                            crops = pd.read_csv(norm_file)["Crop"].dropna().str.strip().unique().tolist()
+                            print(f"[INFO] Auto-discovered {len(crops)} canonical crop(s) after normalization")
+                        else:
+                            run_crop_normalizer(intermediate, norm_file, crops)
                         if intermediate.exists():
                             intermediate.unlink()
                         meta_path.write_text(json.dumps({
                             "state": r.state,
+                            "district": r.district or "",
                             "domains": r.domains or [],
-                            "crops": sorted(existing_crops_meta | set(missing_crops)),
+                            "crops": sorted(crops) if crops else [],
                         }))
-            else:
-                if file_exists:
-                    norm_file = _next_versioned_path(norm_file)
-                    norm_file.parent.mkdir(parents=True, exist_ok=True)
-                    meta_path = norm_file.with_suffix(".json")
-                    print(f"[INFO] Domain/state change — new pre-pipeline output: {norm_file}")
-
-                intermediate = norm_file.parent / f"{norm_file.stem}_state_rows.csv"
-                run_state_filter(raw_file, r.state, intermediate, domains=r.domains or [])
-                if crops is None:
-                    run_crop_normalizer(intermediate, norm_file)
-                    crops = pd.read_csv(norm_file)["Crop"].dropna().str.strip().unique().tolist()
-                    print(f"[INFO] Auto-discovered {len(crops)} canonical crop(s) after normalization")
+                        _df_norm = pd.read_csv(norm_file, low_memory=False)
+                        if "domain" not in _df_norm.columns and "QueryType" in _df_norm.columns:
+                            _df_norm.insert(12, "domain", _df_norm["QueryType"])
+                            _df_norm.to_csv(norm_file, index=False)
                 else:
-                    run_crop_normalizer(intermediate, norm_file, crops)
-                if intermediate.exists():
-                    intermediate.unlink()
-                meta_path.write_text(json.dumps({
-                    "state": r.state,
-                    "domains": r.domains or [],
-                    "crops": sorted(crops) if crops else [],
-                }))
-                _df_norm = pd.read_csv(norm_file, low_memory=False)
-                if "domain" not in _df_norm.columns and "QueryType" in _df_norm.columns:
-                    _df_norm.insert(12, "domain", _df_norm["QueryType"])
-                    _df_norm.to_csv(norm_file, index=False)
-        else:
-            fd, tmp_path = tempfile.mkstemp(suffix="_norm.csv", dir=str(APP_DATA))
-            os.close(fd)
-            norm_file = Path(tmp_path)
-            _norm_is_temp = True
-            print("[INFO] No pre-pipeline output path provided — temp file deleted after use")
-            intermediate = norm_file.parent / f"{norm_file.stem}_state_rows.csv"
-            run_state_filter(raw_file, r.state, intermediate, domains=r.domains or [])
-            if crops is None:
-                run_crop_normalizer(intermediate, norm_file)
-                crops = pd.read_csv(norm_file)["Crop"].dropna().str.strip().unique().tolist()
-                print(f"[INFO] Auto-discovered {len(crops)} canonical crop(s) after normalization")
-            else:
-                run_crop_normalizer(intermediate, norm_file, crops)
-            if intermediate.exists():
-                intermediate.unlink()
-            _df_norm = pd.read_csv(norm_file, low_memory=False)
-            if "domain" not in _df_norm.columns and "QueryType" in _df_norm.columns:
-                _df_norm.insert(12, "domain", _df_norm["QueryType"])
-                _df_norm.to_csv(norm_file, index=False)
+                    fd, tmp_path = tempfile.mkstemp(suffix="_norm.csv", dir=str(APP_DATA))
+                    os.close(fd)
+                    norm_file = Path(tmp_path)
+                    _norm_is_temp = True
+                    print("[INFO] No pre-pipeline output path provided — temp file deleted after use")
+                    intermediate = norm_file.parent / f"{norm_file.stem}_state_rows.csv"
+                    run_state_filter(raw_file, r.state, intermediate,
+                                     domains=r.domains or [], district=r.district)
+                    if crops is None:
+                        run_crop_normalizer(intermediate, norm_file)
+                        crops = pd.read_csv(norm_file)["Crop"].dropna().str.strip().unique().tolist()
+                        print(f"[INFO] Auto-discovered {len(crops)} canonical crop(s) after normalization")
+                    else:
+                        run_crop_normalizer(intermediate, norm_file, crops)
+                    if intermediate.exists():
+                        intermediate.unlink()
+                    _df_norm = pd.read_csv(norm_file, low_memory=False)
+                    if "domain" not in _df_norm.columns and "QueryType" in _df_norm.columns:
+                        _df_norm.insert(12, "domain", _df_norm["QueryType"])
+                        _df_norm.to_csv(norm_file, index=False)
+            effective_raw = str(norm_file)
 
-        effective_raw = str(norm_file)
+            # Upload pre-pipeline output to Zoho immediately after writing.
+            # Use norm_file (not r.pre_output) — it may have been versioned.
+            if r.pre_output and not _norm_is_temp:
+                if norm_file.exists():
+                    _zoho_sync_up(norm_file)
+                if meta_path.exists():
+                    _zoho_sync_up(meta_path)
 
-    state_folder = Path(effective_raw).stem
-    out_base     = _resolve_safe(r.output_dir) / state_folder
+    # Output structure: repair/state_slug/district_folder/crop_slug
+    district_folder = Path(effective_raw).stem
+    out_base = _resolve_safe(r.output_dir) / state_slug / district_folder
 
     def _output_done(crop_slug: str) -> bool:
-        d = out_base / crop_slug
-        return (d / f"{out_base.name}_{crop_slug}.csv").exists() or (d / "dedup_faq.csv").exists()
+        zoho_folder = f"outputs/repair/{state_slug}/{district_folder}/{crop_slug}"
+        _zwd = _get_zoho()
+        result = _zwd.resolve_path(zoho_folder)
+        if result:
+            children = {f["name"] for f in _zwd.list_folder(result[0])}
+            if f"{district_folder}_{crop_slug}.csv" in children or "dedup_faq.csv" in children:
+                return True
+        return False
 
     crops_to_run  = [c for c in crops if not _output_done(slug(c))]
     skipped_crops = [c for c in crops if _output_done(slug(c))]
@@ -594,12 +833,18 @@ def _run_full_sync(r: FullRequest) -> None:
         print(f"[INFO] Skipping {len(skipped_crops)} already-completed crop(s): {', '.join(skipped_crops)}")
     print(f"[INFO] Found {len(crops_to_run)} unique crop(s): {', '.join(crops_to_run)}")
 
-    out_dir_str = str(_resolve_safe(r.output_dir))
+    # Pass repair/state_slug so run_pipeline.py appends district_folder/crop_slug
+    out_dir_str = str(_resolve_safe(r.output_dir) / state_slug)
     failed = []
 
     for crop in crops_to_run:
         _job_ctl.check_cancel()
-        (out_base / slug(crop)).mkdir(parents=True, exist_ok=True)
+        crop_out = out_base / slug(crop)
+        crop_out.mkdir(parents=True, exist_ok=True)
+
+        # Pull any existing intermediates from Zoho so stage-skipping survives restarts
+        _zoho_walk_down(f"outputs/repair/{state_slug}/{district_folder}/{slug(crop)}", APP_DATA)
+
         print(f"[INFO] Starting pipeline for '{crop}'...")
 
         cmd = [
@@ -638,28 +883,56 @@ def _run_full_sync(r: FullRequest) -> None:
         if rc != 0:
             print(f"[WARN] Crop '{crop}' failed (returncode={rc})")
             failed.append(crop)
-        elif not r.skip_post_pipeline:
-            try:
-                post_run_dedup(out_base, [crop])
-            except Exception as exc:
-                print(f"[WARN] Post-pipeline for '{crop}' failed: {exc}")
+        else:
+            if not r.skip_post_pipeline:
+                try:
+                    post_run_dedup(out_base, [crop])
+                except Exception as exc:
+                    print(f"[WARN] Post-pipeline for '{crop}' failed: {exc}")
+            # Upload post-pipeline outputs (pipeline stage files already pushed by run_pipeline.py)
+            _zoho_sync_up_dir(crop_out)
+            shutil.rmtree(crop_out, ignore_errors=True)
+            print(f"[INFO] Cleaned up local folder: {crop_out.relative_to(APP_DATA)}")
+
+    if r.skip_pre_pipeline:
+        _cleaned_ctx.__exit__(None, None, None)
 
     if not r.skip_pre_pipeline and _norm_is_temp and norm_file.exists():
         norm_file.unlink()
         print("[INFO] Temporary pre-pipeline file removed from disk")
 
     if r.pre_output and not r.skip_pre_pipeline:
-        try:
-            cur_meta: dict = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-        except Exception:
-            cur_meta = {}
+        _zwd_meta = _get_zoho()
+        _meta_rel = str(Path(r.pre_output).parent / "meta.json")
+        cur_meta: dict = {}
+        _cm_result = _zwd_meta.resolve_path(_meta_rel)
+        if _cm_result:
+            try:
+                cur_meta = json.loads(_zwd_meta.download_file(_cm_result[0]))
+            except Exception:
+                pass
         newly_done = [c for c in crops_to_run if c not in failed]
         all_crops  = sorted(set(cur_meta.get("crops", [])) | set(newly_done))
         meta_path.write_text(json.dumps({
             "state": r.state,
+            "district": r.district or "",
             "domains": r.domains or [],
             "crops": all_crops,
         }))
+        _zoho_sync_up(meta_path)
+
+    if not crops_to_run:
+        print("[INFO] No new crops processed — skipping Zoho upload")
+
+    # Clean up the district-level local directories — everything is safely in Zoho
+    if r.pre_output and not _norm_is_temp:
+        _norm_parent = _resolve_safe(r.pre_output).parent
+        if _norm_parent.exists():
+            shutil.rmtree(_norm_parent, ignore_errors=True)
+            print(f"[INFO] Cleaned up local pre-pipeline dir: {_norm_parent.relative_to(APP_DATA)}")
+    if out_base.exists():
+        shutil.rmtree(out_base, ignore_errors=True)
+        print(f"[INFO] Cleaned up local repair dir: {out_base.relative_to(APP_DATA)}")
 
     if failed:
         raise RuntimeError(f"The following crops failed: {', '.join(failed)}")
@@ -708,100 +981,57 @@ def run_full(req: FullRequest, background: BackgroundTasks):
 # ---------------------------------------------------------------------------
 
 def _files_tree():
-    """Filtered view of app-data/ for the frontend."""
-    def _file_entry(p: Path) -> dict:
-        return {
-            "name": p.name,
-            "path": str(p.relative_to(APP_DATA)),
-            "size": p.stat().st_size,
-        }
-
-    outputs_dir = APP_DATA / "outputs"
-    repair_dir  = outputs_dir / "repair"
-    final_root  = APP_DATA / "final"
+    """Walk Zoho WorkDrive root and return the same structure the frontend expects."""
+    zwd = _get_zoho()
 
     all_csvs: list[dict] = []
-    csv_ancestor_dirs: set[Path] = set()
-
-    if APP_DATA.exists():
-        for p in APP_DATA.rglob("*.csv"):
-            if ".ipynb_checkpoints" in p.parts:
-                continue
-            try:
-                p.relative_to(outputs_dir)
-                continue
-            except ValueError:
-                pass
-            try:
-                p.relative_to(final_root)
-                continue
-            except ValueError:
-                pass
-            all_csvs.append(_file_entry(p))
-            for ancestor in p.parents:
-                if ancestor == APP_DATA:
-                    break
-                csv_ancestor_dirs.add(ancestor)
-    all_csvs.sort(key=lambda e: e["path"])
-
-    def _add_empty_dirs(d: Path) -> None:
-        if ".ipynb_checkpoints" in d.parts or d.name.startswith("."):
-            return
-        try:
-            d.relative_to(outputs_dir)
-            return
-        except ValueError:
-            pass
-        try:
-            d.relative_to(final_root)
-            return
-        except ValueError:
-            pass
-        if d not in csv_ancestor_dirs:
-            all_csvs.append({
-                "name": d.name,
-                "path": str(d.relative_to(APP_DATA)),
-                "size": 0,
-                "isDir": True,
-            })
-        else:
-            for sub in sorted(d.iterdir()):
-                if sub.is_dir():
-                    _add_empty_dirs(sub)
-
-    if APP_DATA.exists():
-        for d in sorted(APP_DATA.iterdir()):
-            if d.is_dir():
-                _add_empty_dirs(d)
-
     crop_qa_files: list[dict] = []
-    if repair_dir.exists():
-        for qa_file in sorted(repair_dir.rglob("unique_questions_freq_qa.csv")):
-            crop_slug  = qa_file.parent.name
-            state_name = qa_file.parent.parent.name
-            entry = _file_entry(qa_file)
-            entry["crop"]        = crop_slug
-            entry["state"]       = state_name
-            entry["displayName"] = crop_slug
-            crop_qa_files.append(entry)
-
     final_csvs: list[dict] = []
-    if repair_dir.exists():
-        for state_dir in sorted(repair_dir.iterdir()):
-            if not state_dir.is_dir():
-                continue
-            for crop_dir in sorted(state_dir.iterdir()):
-                if not crop_dir.is_dir() or crop_dir.name == "final":
-                    continue
-                for p in sorted(crop_dir.iterdir()):
-                    if not p.is_file():
-                        continue
-                    if p.name.startswith("dedup_") or p.name.startswith("phase_"):
-                        entry = _file_entry(p)
-                        entry["state"]      = state_dir.name
-                        entry["crop"]       = crop_dir.name
-                        entry["folderPath"] = str(crop_dir.relative_to(APP_DATA))
-                        final_csvs.append(entry)
+
+    for path, item in zwd.walk_folder(zwd.root_folder_id):
+        if item["type"] == "folder":
+            continue
+
+        parts = path.split("/")
+        in_outputs = parts[0] == "outputs"
+        in_repair  = in_outputs and len(parts) > 1 and parts[1] == "repair"
+        in_final   = in_outputs and len(parts) > 1 and parts[1] == "final"
+
+        entry = {"name": item["name"], "path": path, "size": item["size"], "id": item["id"]}
+
+        if not in_outputs and not in_final and path.endswith(".csv"):
+            all_csvs.append(entry)
+            continue
+
+        # outputs/repair/<state>/<district>/<crop>/unique_questions_freq_qa.csv
+        if in_repair and len(parts) == 6 and item["name"] == "unique_questions_freq_qa.csv":
+            state, district, crop = parts[2], parts[3], parts[4]
+            all_csvs_entry = dict(entry)
+            all_csvs_entry.update({
+                "crop": crop,
+                "district": district,
+                "state": state,
+                "displayName": crop,
+            })
+            crop_qa_files.append(all_csvs_entry)
+            continue
+
+        # outputs/repair/<state>/<district>/<crop>/{dedup_,phase_}*.csv
+        if (in_repair and len(parts) == 6 and
+                (item["name"].startswith("dedup_") or item["name"].startswith("phase_"))):
+            state, district, crop = parts[2], parts[3], parts[4]
+            folder_entry = dict(entry)
+            folder_entry.update({
+                "state": state,
+                "district": district,
+                "crop": crop,
+                "folderPath": "/".join(parts[:5]),
+            })
+            final_csvs.append(folder_entry)
+
+    all_csvs.sort(key=lambda e: e["path"])
+    crop_qa_files.sort(key=lambda e: e["path"])
+    final_csvs.sort(key=lambda e: e["path"])
 
     return {
         "all_csvs": all_csvs,
@@ -817,52 +1047,97 @@ def get_files_tree():
 
 @app.get("/files/download/{path:path}")
 def download_file(path: str):
-    target = _resolve_safe(path)
-    if not target.exists():
+    # Validate path safety (no traversal, no absolute)
+    _resolve_safe(path)
+    zwd = _get_zoho()
+    result = zwd.resolve_path(path)
+    if result is None:
         raise HTTPException(status_code=404, detail="file not found")
-    return FileResponse(str(target), filename=target.name)
+    file_id, ftype = result
+    if ftype == "folder":
+        raise HTTPException(status_code=400, detail="path is a directory")
+    filename = Path(path).name
+
+    def _stream():
+        resp = zwd.download_file_stream(file_id)
+        for chunk in resp.iter_content(chunk_size=1 << 20):
+            yield chunk
+        resp.close()
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.delete("/files/{path:path}")
 def delete_file(path: str):
-    target = _resolve_safe(path)
-    if not target.exists():
+    _resolve_safe(path)
+    zwd = _get_zoho()
+    result = zwd.resolve_path(path)
+    if result is None:
         raise HTTPException(status_code=404, detail="file not found")
-    if target.is_dir():
+    file_id, ftype = result
+    if ftype == "folder":
         raise HTTPException(status_code=400, detail="path is a directory")
-    target.unlink()
-    parent = target.parent
-    name = target.name
+    if not zwd.delete(file_id):
+        raise HTTPException(status_code=502, detail="Zoho delete failed")
+
+    # Also delete linked base file when a dedup_/phase_ prefixed file is deleted
+    name = Path(path).name
     for prefix in ("dedup_", "phase_"):
         if name.startswith(prefix):
-            base = parent / name[len(prefix):]
-            if base.exists() and base.is_file():
-                base.unlink()
+            base_path = str(Path(path).parent / name[len(prefix):])
+            base_result = zwd.resolve_path(base_path)
+            if base_result:
+                zwd.delete(base_result[0])
             break
+
     return {"deleted": path}
 
 
 @app.delete("/folders/{path:path}")
 def delete_folder(path: str):
-    target = _resolve_safe(path)
-    if not target.exists():
+    _resolve_safe(path)
+    zwd = _get_zoho()
+    result = zwd.resolve_path(path)
+    if result is None:
         raise HTTPException(status_code=404, detail="folder not found")
-    if not target.is_dir():
+    file_id, ftype = result
+    if ftype != "folder":
         raise HTTPException(status_code=400, detail="path is not a directory")
-    shutil.rmtree(target)
+    if not zwd.delete(file_id):
+        raise HTTPException(status_code=502, detail="Zoho delete failed")
     return {"deleted": path}
 
 
 @app.post("/files/rename/{path:path}")
 def rename_file(path: str, body: RenameRequest):
-    source = _resolve_safe(path)
-    dest   = _resolve_safe(body.to)
-    if not source.exists():
+    _resolve_safe(path)
+    _resolve_safe(body.to)
+    zwd = _get_zoho()
+    src_result = zwd.resolve_path(path)
+    if src_result is None:
         raise HTTPException(status_code=404, detail="source not found")
-    if dest.exists():
+    dst_result = zwd.resolve_path(body.to)
+    if dst_result is not None:
         raise HTTPException(status_code=409, detail="destination already exists")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    source.rename(dest)
+
+    file_id = src_result[0]
+    src_parts = [p for p in path.split("/") if p]
+    dst_parts = [p for p in body.to.split("/") if p]
+
+    src_parent = "/".join(src_parts[:-1])
+    dst_parent = "/".join(dst_parts[:-1])
+    dst_name   = dst_parts[-1] if dst_parts else path
+
+    if src_parts[-1] != dst_name:
+        zwd.rename(file_id, dst_name)
+    if src_parent != dst_parent:
+        new_parent_id = zwd.ensure_path(dst_parent) if dst_parent else zwd.root_folder_id
+        zwd.move(file_id, new_parent_id)
+
     return {"from": path, "to": body.to}
 
 
@@ -871,9 +1146,10 @@ def create_folder(body: dict):
     rel_path = body.get("path", "")
     if not rel_path:
         raise HTTPException(status_code=400, detail="path is required")
-    target = _resolve_safe(rel_path)
-    target.mkdir(parents=True, exist_ok=True)
-    return {"created": rel_path}
+    _resolve_safe(rel_path)
+    zwd = _get_zoho()
+    folder_id = zwd.ensure_path(rel_path)
+    return {"created": rel_path, "id": folder_id}
 
 
 @app.post("/files/upload-chunk")
@@ -892,58 +1168,68 @@ async def upload_file_chunk(
     if not all((tmp_dir / f"{i:06d}").exists() for i in range(total_chunks)):
         return {"chunk": chunk_index, "total": total_chunks}
 
-    save_dir = _resolve_safe(dest) if dest else APP_DATA
-    save_dir.mkdir(parents=True, exist_ok=True)
-    target = (save_dir / filename).resolve()
-    if not target.is_relative_to(APP_DATA.resolve()):
-        shutil.rmtree(tmp_dir)
-        raise HTTPException(status_code=400, detail="path escapes sandbox")
+    if dest:
+        _resolve_safe(dest)
+    zoho_folder = dest if dest else ""
 
-    with target.open("wb") as f:
-        for i in range(total_chunks):
-            f.write((tmp_dir / f"{i:06d}").read_bytes())
-    shutil.rmtree(tmp_dir)
-    return {"uploaded": str(target.relative_to(APP_DATA))}
+    content = b""
+    for i in range(total_chunks):
+        content += (tmp_dir / f"{i:06d}").read_bytes()
+
+    zwd = _get_zoho()
+    parent_id = zwd.ensure_path(zoho_folder) if zoho_folder else zwd.root_folder_id
+    file_id = zwd.upload_file(filename, content, parent_id)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    zoho_path = f"{zoho_folder}/{filename}" if zoho_folder else filename
+    return {"uploaded": zoho_path, "id": file_id}
 
 
 @app.post("/files/upload")
 async def upload_file(dest: str = "", file: UploadFile = File(...)):
     if dest:
         _resolve_safe(dest)
-        save_dir = (APP_DATA / dest).resolve()
-    else:
-        save_dir = APP_DATA
-    save_dir.mkdir(parents=True, exist_ok=True)
-    target = (save_dir / file.filename).resolve()
-    if not target.is_relative_to(APP_DATA.resolve()):
-        raise HTTPException(status_code=400, detail="path escapes sandbox")
     content = await file.read()
-    target.write_bytes(content)
-    return {"uploaded": str(target.relative_to(APP_DATA))}
+    zwd = _get_zoho()
+    parent_id = zwd.ensure_path(dest) if dest else zwd.root_folder_id
+    file_id = zwd.upload_file(file.filename, content, parent_id)
+    zoho_path = f"{dest}/{file.filename}" if dest else file.filename
+    return {"uploaded": zoho_path, "id": file_id}
 
 
 @app.post("/files/upload-audited")
 async def upload_audited(
     state: str = Form(...),
+    district: str = Form(...),
     crop: str = Form(...),
     file: UploadFile = File(...),
 ):
-    target = _resolve_safe(f"outputs/repair/{state}/{crop}/audit_{file.filename}")
-    if not target.parent.exists():
-        raise HTTPException(status_code=404, detail="crop folder not found")
+    audit_filename = f"audit_{file.filename}"
+    zoho_folder = f"outputs/repair/{state}/{district}/{crop}"
     content = await file.read()
-    target.write_bytes(content)
 
-    meta_path = target.parent / "meta.json"
+    zwd = _get_zoho()
+
+    # Verify crop folder exists in Zoho before accepting the upload
+    if zwd.resolve_path(zoho_folder) is None:
+        raise HTTPException(status_code=404, detail="crop folder not found in WorkDrive")
+
+    parent_id = zwd.ensure_path(zoho_folder)
+    zwd.upload_file(audit_filename, content, parent_id)
+
+    # Read and update meta.json from Zoho
+    meta_zoho_path = f"{zoho_folder}/meta.json"
     meta = {"download": False, "audit": False}
-    if meta_path.exists():
+    meta_result = zwd.resolve_path(meta_zoho_path)
+    if meta_result:
         try:
-            meta = json.loads(meta_path.read_text())
+            meta = json.loads(zwd.download_file(meta_result[0]))
         except Exception:
             pass
     meta["audit"] = True
-    meta_path.write_text(json.dumps(meta))
-    return {"uploaded": str(target.relative_to(APP_DATA))}
+    zwd.upload_file("meta.json", json.dumps(meta).encode(), parent_id)
+
+    return {"uploaded": f"{zoho_folder}/{audit_filename}"}
 
 
 # ---------------------------------------------------------------------------
@@ -951,35 +1237,49 @@ async def upload_audited(
 # ---------------------------------------------------------------------------
 
 @app.get("/app/next-state")
-def get_next_state(state: str = "", domains: List[str] = Query(default=[])):
-    _slug = re.sub(r"[^a-z0-9]+", "_", state.lower()).strip("_") if state else "state"
-    pattern = re.compile(rf"^{re.escape(_slug)}_(\d+)$")
+def get_next_state(
+    state: str = "",
+    district: str = "",
+    domains: List[str] = Query(default=[]),
+):
+    state_slug  = re.sub(r"[^a-z0-9]+", "_", state.lower()).strip("_") if state else "state"
+    dist_slug   = re.sub(r"[^a-z0-9]+", "_", district.lower()).strip("_") if district else state_slug
+    pattern     = re.compile(rf"^{re.escape(dist_slug)}_(\d+)$")
     sorted_domains = sorted(domains)
 
-    existing: list[tuple[int, Path]] = []
-    if APP_DATA.exists():
-        for p in APP_DATA.iterdir():
-            m = pattern.match(p.name)
-            if m and p.is_dir():
-                existing.append((int(m.group(1)), p))
+    zwd = _get_zoho()
+    state_folder = zwd.resolve_path(state_slug)
+    existing: list[tuple[int, str, str]] = []  # (idx, folder_name, folder_id)
 
-    for idx, folder in sorted(existing):
-        meta_path = folder / "meta.json"
-        if meta_path.exists():
+    if state_folder:
+        state_folder_id = state_folder[0]
+        for item in zwd.list_folder(state_folder_id):
+            if item["type"] != "folder":
+                continue
+            m = pattern.match(item["name"])
+            if m:
+                existing.append((int(m.group(1)), item["name"], item["id"]))
+
+    for idx, folder_name, folder_id in sorted(existing):
+        meta_result = zwd.find_child(folder_id, "meta.json")
+        if meta_result:
             try:
-                meta = json.loads(meta_path.read_text())
-                if sorted(meta.get("domains", [])) == sorted_domains:
+                meta = json.loads(zwd.download_file(meta_result["id"]))
+                if (meta.get("district", "") == district and
+                        sorted(meta.get("domains", [])) == sorted_domains):
                     return {
-                        "name": folder.name,
+                        "name": folder_name,
+                        "state": state_slug,
                         "is_new": False,
                         "existing_crops": meta.get("crops", []),
                     }
             except Exception:
                 pass
 
-    next_idx = max((i for i, _ in existing), default=-1) + 1
+    next_idx = max((i for i, _, _ in existing), default=-1) + 1
     return {
-        "name": f"{_slug}_{next_idx}",
+        "name": f"{dist_slug}_{next_idx}",
+        "state": state_slug,
         "is_new": True,
         "existing_crops": [],
     }
@@ -987,83 +1287,133 @@ def get_next_state(state: str = "", domains: List[str] = Query(default=[])):
 
 @app.get("/app/state-table")
 def get_state_table():
-    repair_dir = APP_DATA / "outputs" / "repair"
+    zwd = _get_zoho()
     rows = []
 
-    if not repair_dir.exists():
+    repair_result = zwd.resolve_path("outputs/repair")
+    if repair_result is None:
         return {"rows": rows}
 
-    for state_dir in sorted(repair_dir.iterdir()):
-        if not state_dir.is_dir():
+    repair_id = repair_result[0]
+
+    for state_item in sorted(zwd.list_folder(repair_id), key=lambda x: x["name"]):
+        if state_item["type"] != "folder" or state_item["name"].startswith("."):
             continue
-        state_name = state_dir.name
+        state_name = state_item["name"]
 
-        domains: list[str] = []
-        meta_path = APP_DATA / state_name / "meta.json"
-        if meta_path.exists():
-            try:
-                domains = json.loads(meta_path.read_text()).get("domains", [])
-            except Exception:
-                pass
+        district_items = sorted(
+            zwd.list_folder(state_item["id"]),
+            key=lambda d: (0 if d["name"].startswith(state_name) else 1, d["name"]),
+        )
 
-        for crop_dir in sorted(state_dir.iterdir()):
-            if not crop_dir.is_dir() or crop_dir.name == "final":
+        for district_item in district_items:
+            if district_item["type"] != "folder" or district_item["name"].startswith("."):
                 continue
+            district_name = district_item["name"]
 
-            dedup = crop_dir / f"{state_name}_{crop_dir.name}.csv"
-            if not dedup.exists():
-                dedup = crop_dir / "dedup_faq.csv"
-            output_file = str(dedup.relative_to(APP_DATA)) if dedup.exists() else None
-
-            audit_file = None
-            for f in sorted(crop_dir.iterdir()):
-                if f.name.startswith("audit_") and f.suffix == ".csv":
-                    audit_file = str(f.relative_to(APP_DATA))
-                    break
-
-            crop_meta = {"download": False, "audit": False}
-            crop_meta_path = crop_dir / "meta.json"
-            if crop_meta_path.exists():
+            # Read domains from pre-pipeline meta.json in {state}/{district}/meta.json
+            domains: list[str] = []
+            pre_meta_path = f"{state_name}/{district_name}/meta.json"
+            pre_meta_result = zwd.resolve_path(pre_meta_path)
+            if pre_meta_result:
                 try:
-                    crop_meta = json.loads(crop_meta_path.read_text())
+                    domains = json.loads(zwd.download_file(pre_meta_result[0])).get("domains", [])
                 except Exception:
                     pass
-            elif output_file:
-                crop_meta_path.write_text(json.dumps(crop_meta))
 
-            rows.append({
-                "state": state_name,
-                "crop": crop_dir.name,
-                "domains": domains,
-                "output_file": output_file,
-                "audit_file": audit_file,
-                "downloaded": crop_meta.get("download", False),
-                "audited": crop_meta.get("audit", False),
-            })
+            for crop_item in sorted(zwd.list_folder(district_item["id"]), key=lambda x: x["name"]):
+                if crop_item["type"] != "folder" or crop_item["name"] in ("final",) or crop_item["name"].startswith("."):
+                    continue
+                crop_name = crop_item["name"]
+
+                # Collect files in this crop folder
+                crop_files = zwd.list_folder(crop_item["id"])
+                file_names = {f["name"]: f for f in crop_files}
+
+                # Find output file
+                output_path = None
+                for candidate in (f"{district_name}_{crop_name}.csv", "dedup_faq.csv"):
+                    if candidate in file_names:
+                        output_path = f"outputs/repair/{state_name}/{district_name}/{crop_name}/{candidate}"
+                        break
+
+                # Find audit file
+                audit_path = None
+                for fname in sorted(file_names):
+                    if fname.startswith("audit_") and fname.endswith(".csv"):
+                        audit_path = f"outputs/repair/{state_name}/{district_name}/{crop_name}/{fname}"
+                        break
+
+                # Read crop meta.json
+                crop_meta = {"download": False, "audit": False}
+                if "meta.json" in file_names:
+                    try:
+                        crop_meta = json.loads(zwd.download_file(file_names["meta.json"]["id"]))
+                    except Exception:
+                        pass
+                elif output_path:
+                    # Bootstrap meta.json in Zoho for new outputs
+                    try:
+                        zwd.upload_file("meta.json", json.dumps(crop_meta).encode(), crop_item["id"])
+                    except Exception:
+                        pass
+
+                rows.append({
+                    "state": state_name,
+                    "district": district_name,
+                    "crop": crop_name,
+                    "domains": domains,
+                    "output_file": output_path,
+                    "audit_file": audit_path,
+                    "downloaded": crop_meta.get("download", False),
+                    "audited": crop_meta.get("audit", False),
+                })
 
     return {"rows": rows}
 
 
-@app.get("/app/output/{state}/{crop}")
-def download_output(state: str, crop: str):
-    """Download the output CSV for a state/crop and mark it downloaded."""
-    crop_dir = _resolve_safe(f"outputs/repair/{state}/{crop}")
-    dedup = crop_dir / f"{state}_{crop}.csv"
-    if not dedup.exists():
-        dedup = crop_dir / "dedup_faq.csv"
-    if not dedup.exists():
+@app.get("/app/output/{state}/{district}/{crop}")
+def download_output(state: str, district: str, crop: str):
+    """Download the output CSV for a state/district/crop and mark it downloaded."""
+    zwd = _get_zoho()
+    crop_folder_path = f"outputs/repair/{state}/{district}/{crop}"
+    crop_folder_result = zwd.resolve_path(crop_folder_path)
+    if crop_folder_result is None:
         raise HTTPException(status_code=404, detail="output not found")
 
-    meta_path = crop_dir / "meta.json"
+    crop_folder_id = crop_folder_result[0]
+    crop_files = {f["name"]: f for f in zwd.list_folder(crop_folder_id)}
+
+    # Find the dedup output
+    output_filename = None
+    for candidate in (f"{district}_{crop}.csv", "dedup_faq.csv"):
+        if candidate in crop_files:
+            output_filename = candidate
+            break
+    if output_filename is None:
+        raise HTTPException(status_code=404, detail="output not found")
+
+    file_id = crop_files[output_filename]["id"]
+
+    # Update meta.json to mark as downloaded
     meta = {"download": False, "audit": False}
-    if meta_path.exists():
+    if "meta.json" in crop_files:
         try:
-            meta = json.loads(meta_path.read_text())
+            meta = json.loads(zwd.download_file(crop_files["meta.json"]["id"]))
         except Exception:
             pass
     meta["download"] = True
-    meta_path.write_text(json.dumps(meta))
-    return FileResponse(str(dedup), filename=f"{state}_{crop}.csv")
+    try:
+        zwd.upload_file("meta.json", json.dumps(meta).encode(), crop_folder_id)
+    except Exception as e:
+        print(f"[ZOHO] meta.json update failed: {e}")
+
+    content = zwd.download_file(file_id)
+    return StreamingResponse(
+        iter([content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{district}_{crop}.csv"'},
+    )
 
 
 # ---------------------------------------------------------------------------

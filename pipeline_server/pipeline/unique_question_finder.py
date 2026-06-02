@@ -328,11 +328,13 @@ def cross_cluster_dedup(uq_rows: list, freq_map: dict,
     if len(uq_rows) <= 1:
         return uq_rows
 
+    import torch
     from sentence_transformers import SentenceTransformer
     print("\nCross-cluster dedup: encoding representative questions...")
+    device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
     st_model = SentenceTransformer(
         'sentence-transformers/paraphrase-multilingual-mpnet-base-v2',
-        device=f"cuda:{gpu_id}")
+        device=device)
     reps = [r["representative_question"] for r in uq_rows]
     embs = st_model.encode(reps, batch_size=128, show_progress_bar=False,
                            convert_to_numpy=True, normalize_embeddings=True)

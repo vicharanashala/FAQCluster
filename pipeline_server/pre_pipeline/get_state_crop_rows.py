@@ -10,6 +10,7 @@ parser.add_argument("--input", required=True, help="Input CSV file")
 parser.add_argument("--output", required=True, help="Output CSV file")
 parser.add_argument("--crop", help="Regex pattern to match crop names (optional)")
 parser.add_argument("--state", help="Comma-separated state name(s) to filter (optional)")
+parser.add_argument("--district", help="Comma-separated district name(s) to filter (optional)")
 parser.add_argument("--domains", help="Comma-separated QueryType values to filter (optional)")
 
 args = parser.parse_args()
@@ -55,6 +56,14 @@ if args.crop:
 if args.state:
     target_states = [s.strip().lower() for s in args.state.split(",") if s.strip()]
     df_filtered = df_filtered[df_filtered["StateName"].isin(target_states)]
+
+# Apply District filter if provided
+if args.district:
+    if "DistrictName" not in df_filtered.columns:
+        raise ValueError("Column 'DistrictName' not found")
+    target_districts = [d.strip().lower() for d in args.district.split(",") if d.strip()]
+    df_filtered["DistrictName"] = df_filtered["DistrictName"].astype(str).str.strip().str.lower()
+    df_filtered = df_filtered[df_filtered["DistrictName"].isin(target_districts)]
 
 # Apply Domain (QueryType) filter if provided
 if args.domains:

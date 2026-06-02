@@ -10,6 +10,7 @@ Usage:
 """
 
 import os
+import torch
 import pandas as pd
 import numpy as np
 import argparse
@@ -60,7 +61,7 @@ class LocalHFJudge:
     def __init__(self, model_name: str = DEFAULT_MODEL, batch_size: int = 8, gpu_id: int = 0):
         self.model_name  = model_name or _API_MODEL
         self.batch_size  = batch_size
-        self.device      = f"cuda:{gpu_id}"
+        self.device      = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
         self._session    = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
         if _API_KEY:

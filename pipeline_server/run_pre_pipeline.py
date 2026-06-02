@@ -69,7 +69,8 @@ def _stream(cmd: list) -> None:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
-def run_state_filter(input_path: Path, state: str, intermediate: Path, domains: list[str] = None):
+def run_state_filter(input_path: Path, state: str, intermediate: Path,
+                     domains: list[str] = None, district: str = None):
     banner("Stage 1/2 — State Filter")
     cmd = [
         sys.executable,
@@ -78,13 +79,17 @@ def run_state_filter(input_path: Path, state: str, intermediate: Path, domains: 
         '--state',  state,
         '--output', str(intermediate),
     ]
+    if district:
+        cmd += ['--district', district]
     if domains:
         cmd += ['--domains', ','.join(domains)]
-    print(f"  Input  : {input_path}")
-    print(f"  State  : {state}")
+    print(f"  Input    : {input_path}")
+    print(f"  State    : {state}")
+    if district:
+        print(f"  District : {district}")
     if domains:
-        print(f"  Domains: {', '.join(domains)}")
-    print(f"  Output : {intermediate}")
+        print(f"  Domains  : {', '.join(domains)}")
+    print(f"  Output   : {intermediate}")
     _stream(cmd)
     print(f"\n  ✓ State filter complete")
 
