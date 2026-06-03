@@ -342,6 +342,8 @@ def phase1_fast_screening(df, configs, model, stop_words):
     print("PHASE 1: FAST SCREENING")
     print("="*70)
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     # Shared caches: embeddings computed once; distances once per alpha;
     # UMAP once per (alpha, n_neighbors, n_components)
     embed_cache = {}

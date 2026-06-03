@@ -41,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -889,8 +890,11 @@ def _run_full_sync(r: FullRequest) -> None:
                     post_run_dedup(out_base, [crop])
                 except Exception as exc:
                     print(f"[WARN] Post-pipeline for '{crop}' failed: {exc}")
-            # Upload post-pipeline outputs (pipeline stage files already pushed by run_pipeline.py)
-            _zoho_sync_up_dir(crop_out)
+            # run_pipeline.py already uploads all intermediate files per-stage.
+            # Only upload the 3 files post-pipeline writes (or updated).
+            crop_slug = slug(crop)
+            for fname in ["phase_data_faq.csv", f"{district_folder}_{crop_slug}.csv", "meta.json"]:
+                _zoho_sync_up(crop_out / fname)
             shutil.rmtree(crop_out, ignore_errors=True)
             print(f"[INFO] Cleaned up local folder: {crop_out.relative_to(APP_DATA)}")
 
@@ -1285,8 +1289,20 @@ def get_next_state(
     }
 
 
+_state_table_cache: dict = {"rows": None, "ts": 0.0}
+_STATE_TABLE_TTL = 60  # seconds
+
+
 @app.get("/app/state-table")
-def get_state_table():
+def get_state_table(refresh: bool = False):
+    now = time.monotonic()
+    if (
+        not refresh
+        and _state_table_cache["rows"] is not None
+        and now - _state_table_cache["ts"] < _STATE_TABLE_TTL
+    ):
+        return {"rows": _state_table_cache["rows"], "cached": True}
+
     zwd = _get_zoho()
     rows = []
 
@@ -1369,7 +1385,9 @@ def get_state_table():
                     "audited": crop_meta.get("audit", False),
                 })
 
-    return {"rows": rows}
+    _state_table_cache["rows"] = rows
+    _state_table_cache["ts"] = time.monotonic()
+    return {"rows": rows, "cached": False}
 
 
 @app.get("/app/output/{state}/{district}/{crop}")
