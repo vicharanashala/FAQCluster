@@ -632,12 +632,6 @@ def main():
         _z_push(_zwd, _zrel, out_dir / 'unique_questions_freq_qa.csv')
 
     # ── Done ──────────────────────────────────────────────────────────────────
-    import json as _json
-    _meta_path = out_dir / "meta.json"
-    if not _meta_path.exists():
-        _meta_path.write_text(_json.dumps({"download": False, "audit": False}))
-    _z_push(_zwd, _zrel, _meta_path)
-
     elapsed = datetime.now() - start_time
     banner("Pipeline Complete!")
     faq = out_dir / 'unique_questions_freq.csv'

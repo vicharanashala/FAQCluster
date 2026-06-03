@@ -101,18 +101,6 @@ def run_dedup(input_dir: Path, crops: list | None = None):
         print(f"  Saved: {crop_dir.name}/{PHASE_OUT}")
         print(f"  Saved: {crop_dir.name}/{dedup_out_name}")
 
-        import json as _json
-        _meta_path = crop_dir / "meta.json"
-        _meta = {"download": False, "audit": False}
-        if _meta_path.exists():
-            try:
-                _meta = _json.loads(_meta_path.read_text())
-                _meta.setdefault("download", False)
-                _meta.setdefault("audit", False)
-            except Exception:
-                pass
-        _meta_path.write_text(_json.dumps(_meta))
-
     print(f"\n  ✓ Deduplication complete")
 
 

@@ -56,6 +56,8 @@ try:
 except ImportError:
     pass
 
+from contextlib import asynccontextmanager
+
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -181,7 +183,12 @@ def _zoho_walk_down(zoho_path: str, local_base: Path) -> None:
 _CHUNK_TMP = Path(tempfile.gettempdir()) / "faq_chunks"
 _RUN_PIPELINE = SCRIPT_DIR / "run_pipeline.py"
 
-app = FastAPI(title="FAQCluster Pipeline Service", redirect_slashes=False)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    threading.Thread(target=_load_or_build_master, daemon=True, name="master-json-init").start()
+    yield
+
+app = FastAPI(title="FAQCluster Pipeline Service", redirect_slashes=False, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -466,9 +473,6 @@ def _run_pre_sync(r: PreRequest) -> None:
         intermediate.unlink()
 
     _zoho_sync_up(output_path)
-    meta_path = output_path.parent / "meta.json"
-    if meta_path.exists():
-        _zoho_sync_up(meta_path)
 
 
 def _run_pipeline_sync(r: PipelineRequest) -> None:
@@ -832,6 +836,18 @@ def _run_full_sync(r: FullRequest) -> None:
     skipped_crops = [c for c in crops if _output_done(slug(c))]
     if skipped_crops:
         print(f"[INFO] Skipping {len(skipped_crops)} already-completed crop(s): {', '.join(skipped_crops)}")
+        with _master_lock:
+            for _sc in skipped_crops:
+                _sc_slug = slug(_sc)
+                entry = _master_data.setdefault(state_slug, {}).setdefault(district_folder, {}).setdefault(_sc_slug, {})
+                entry.update({
+                    "output_file": f"outputs/repair/{state_slug}/{district_folder}/{_sc_slug}/{district_folder}_{_sc_slug}.csv",
+                    "processed": True,
+                })
+            try:
+                _upload_master_json()
+            except Exception as e:
+                print(f"[MASTER] Failed to upload master.json for skipped crops: {e}")
     print(f"[INFO] Found {len(crops_to_run)} unique crop(s): {', '.join(crops_to_run)}")
 
     # Pass repair/state_slug so run_pipeline.py appends district_folder/crop_slug
@@ -891,12 +907,17 @@ def _run_full_sync(r: FullRequest) -> None:
                 except Exception as exc:
                     print(f"[WARN] Post-pipeline for '{crop}' failed: {exc}")
             # run_pipeline.py already uploads all intermediate files per-stage.
-            # Only upload the 3 files post-pipeline writes (or updated).
+            # Only upload the 2 files post-pipeline writes.
             crop_slug = slug(crop)
-            for fname in ["phase_data_faq.csv", f"{district_folder}_{crop_slug}.csv", "meta.json"]:
+            for fname in ["phase_data_faq.csv", f"{district_folder}_{crop_slug}.csv"]:
                 _zoho_sync_up(crop_out / fname)
             shutil.rmtree(crop_out, ignore_errors=True)
             print(f"[INFO] Cleaned up local folder: {crop_out.relative_to(APP_DATA)}")
+            _update_master_crop(
+                state_slug, district_folder, crop_slug,
+                output_file=f"outputs/repair/{state_slug}/{district_folder}/{crop_slug}/{district_folder}_{crop_slug}.csv",
+                processed=True,
+            )
 
     if r.skip_pre_pipeline:
         _cleaned_ctx.__exit__(None, None, None)
@@ -1221,17 +1242,8 @@ async def upload_audited(
     parent_id = zwd.ensure_path(zoho_folder)
     zwd.upload_file(audit_filename, content, parent_id)
 
-    # Read and update meta.json from Zoho
-    meta_zoho_path = f"{zoho_folder}/meta.json"
-    meta = {"download": False, "audit": False}
-    meta_result = zwd.resolve_path(meta_zoho_path)
-    if meta_result:
-        try:
-            meta = json.loads(zwd.download_file(meta_result[0]))
-        except Exception:
-            pass
-    meta["audit"] = True
-    zwd.upload_file("meta.json", json.dumps(meta).encode(), parent_id)
+    _update_master_crop(state, district, crop, audited=True,
+                        audit_file=f"{zoho_folder}/{audit_filename}")
 
     return {"uploaded": f"{zoho_folder}/{audit_filename}"}
 
@@ -1289,27 +1301,40 @@ def get_next_state(
     }
 
 
-_state_table_cache: dict = {"rows": None, "ts": 0.0}
-_STATE_TABLE_TTL = 60  # seconds
+# ---------------------------------------------------------------------------
+# master.json — persistent state-table cache in Zoho root
+#
+# Shape:
+#   { "built_at": "<iso>",
+#     "data": { "<state>": { "<district>": { "<crop>": {
+#       "output_file": str|null, "audit_file": str|null,
+#       "downloaded": bool, "audited": bool, "processed": bool
+#     }}}}}
+# ---------------------------------------------------------------------------
+
+_master_ready  = threading.Event()
+_master_lock   = threading.Lock()
+_master_data: dict = {}   # in-memory nested copy of master.json["data"]
+
+MASTER_JSON_NAME = "master.json"
 
 
-@app.get("/app/state-table")
-def get_state_table(refresh: bool = False):
-    now = time.monotonic()
-    if (
-        not refresh
-        and _state_table_cache["rows"] is not None
-        and now - _state_table_cache["ts"] < _STATE_TABLE_TTL
-    ):
-        return {"rows": _state_table_cache["rows"], "cached": True}
-
+def _upload_master_json() -> None:
+    """Write current _master_data to master.json in Zoho root. Caller must hold _master_lock."""
     zwd = _get_zoho()
-    rows = []
+    payload = json.dumps({"built_at": datetime.now(timezone.utc).isoformat(), "data": _master_data})
+    zwd.upload_file(MASTER_JSON_NAME, payload.encode(), zwd.root_folder_id)
+    print("[MASTER] master.json uploaded to Zoho root")
+
+
+def _build_master_data_from_zoho() -> dict:
+    """Walk outputs/repair tree in Zoho and return a fresh nested data dict."""
+    zwd = _get_zoho()
+    data: dict = {}
 
     repair_result = zwd.resolve_path("outputs/repair")
     if repair_result is None:
-        return {"rows": rows}
-
+        return data
     repair_id = repair_result[0]
 
     for state_item in sorted(zwd.list_folder(repair_id), key=lambda x: x["name"]):
@@ -1327,67 +1352,116 @@ def get_state_table(refresh: bool = False):
                 continue
             district_name = district_item["name"]
 
-            # Read domains from pre-pipeline meta.json in {state}/{district}/meta.json
-            domains: list[str] = []
-            pre_meta_path = f"{state_name}/{district_name}/meta.json"
-            pre_meta_result = zwd.resolve_path(pre_meta_path)
-            if pre_meta_result:
-                try:
-                    domains = json.loads(zwd.download_file(pre_meta_result[0])).get("domains", [])
-                except Exception:
-                    pass
-
             for crop_item in sorted(zwd.list_folder(district_item["id"]), key=lambda x: x["name"]):
                 if crop_item["type"] != "folder" or crop_item["name"] in ("final",) or crop_item["name"].startswith("."):
                     continue
                 crop_name = crop_item["name"]
 
-                # Collect files in this crop folder
-                crop_files = zwd.list_folder(crop_item["id"])
-                file_names = {f["name"]: f for f in crop_files}
+                # Last-wins on Zoho duplicate filenames
+                crop_files: dict[str, dict] = {}
+                for f in zwd.list_folder(crop_item["id"]):
+                    crop_files[f["name"]] = f
 
-                # Find output file
-                output_path = None
+                output_file = None
                 for candidate in (f"{district_name}_{crop_name}.csv", "dedup_faq.csv"):
-                    if candidate in file_names:
-                        output_path = f"outputs/repair/{state_name}/{district_name}/{crop_name}/{candidate}"
+                    if candidate in crop_files:
+                        output_file = f"outputs/repair/{state_name}/{district_name}/{crop_name}/{candidate}"
                         break
 
-                # Find audit file
-                audit_path = None
-                for fname in sorted(file_names):
+                audit_file = None
+                for fname in sorted(crop_files):
                     if fname.startswith("audit_") and fname.endswith(".csv"):
-                        audit_path = f"outputs/repair/{state_name}/{district_name}/{crop_name}/{fname}"
+                        audit_file = f"outputs/repair/{state_name}/{district_name}/{crop_name}/{fname}"
                         break
 
-                # Read crop meta.json
-                crop_meta = {"download": False, "audit": False}
-                if "meta.json" in file_names:
-                    try:
-                        crop_meta = json.loads(zwd.download_file(file_names["meta.json"]["id"]))
-                    except Exception:
-                        pass
-                elif output_path:
-                    # Bootstrap meta.json in Zoho for new outputs
-                    try:
-                        zwd.upload_file("meta.json", json.dumps(crop_meta).encode(), crop_item["id"])
-                    except Exception:
-                        pass
+                data.setdefault(state_name, {}).setdefault(district_name, {})[crop_name] = {
+                    "output_file": output_file,
+                    "audit_file": audit_file,
+                    "downloaded": False,
+                    "audited": False,
+                    "processed": output_file is not None,
+                }
 
+    return data
+
+
+def _load_or_build_master() -> None:
+    """Called once at startup: load master.json from Zoho root if present, else build it."""
+    global _master_data
+    zwd = _get_zoho()
+    existing = zwd.find_child(zwd.root_folder_id, MASTER_JSON_NAME)
+    if existing:
+        try:
+            payload = json.loads(zwd.download_file(existing["id"]))
+            with _master_lock:
+                _master_data = payload.get("data", {})
+            print("[MASTER] Loaded master.json from Zoho root")
+            _master_ready.set()
+            return
+        except Exception as e:
+            print(f"[MASTER] Failed to load existing master.json ({e}), rebuilding")
+
+    _rebuild_master()
+
+
+def _rebuild_master() -> None:
+    """Full Zoho walk → rebuild _master_data → upload master.json → set ready."""
+    global _master_data
+    print("[MASTER] Building master.json from Zoho tree …")
+    try:
+        new_data = _build_master_data_from_zoho()
+        with _master_lock:
+            _master_data = new_data
+            _upload_master_json()
+        _master_ready.set()
+        print("[MASTER] master.json ready")
+    except Exception as e:
+        print(f"[MASTER] Build failed: {e}")
+        _master_ready.set()  # unblock requests even on failure
+
+
+def _update_master_crop(state: str, district: str, crop: str, **updates) -> None:
+    """Update a single crop entry in memory and re-upload master.json."""
+    with _master_lock:
+        entry = _master_data.setdefault(state, {}).setdefault(district, {}).setdefault(crop, {})
+        entry.update(updates)
+        try:
+            _upload_master_json()
+        except Exception as e:
+            print(f"[MASTER] Failed to upload master.json after update: {e}")
+
+
+def _master_to_rows() -> list[dict]:
+    rows = []
+    with _master_lock:
+        snapshot = json.loads(json.dumps(_master_data))  # shallow-safe copy under lock
+    for state_name, districts in sorted(snapshot.items()):
+        for district_name, crops in sorted(districts.items()):
+            for crop_name, d in sorted(crops.items()):
                 rows.append({
                     "state": state_name,
                     "district": district_name,
                     "crop": crop_name,
-                    "domains": domains,
-                    "output_file": output_path,
-                    "audit_file": audit_path,
-                    "downloaded": crop_meta.get("download", False),
-                    "audited": crop_meta.get("audit", False),
+                    "output_file": d.get("output_file"),
+                    "audit_file": d.get("audit_file"),
+                    "downloaded": d.get("downloaded", False),
+                    "audited": d.get("audited", False),
+                    "processed": d.get("processed", False),
                 })
+    return rows
 
-    _state_table_cache["rows"] = rows
-    _state_table_cache["ts"] = time.monotonic()
-    return {"rows": rows, "cached": False}
+
+@app.get("/app/state-table")
+def get_state_table(refresh: bool = False):
+    if refresh:
+        _master_ready.clear()
+        threading.Thread(target=_rebuild_master, daemon=True, name="master-json-refresh").start()
+        return {"status": "loading", "rows": []}
+
+    if not _master_ready.is_set():
+        return {"status": "loading", "rows": []}
+
+    return {"status": "ready", "rows": _master_to_rows()}
 
 
 @app.get("/app/output/{state}/{district}/{crop}")
@@ -1413,18 +1487,7 @@ def download_output(state: str, district: str, crop: str):
 
     file_id = crop_files[output_filename]["id"]
 
-    # Update meta.json to mark as downloaded
-    meta = {"download": False, "audit": False}
-    if "meta.json" in crop_files:
-        try:
-            meta = json.loads(zwd.download_file(crop_files["meta.json"]["id"]))
-        except Exception:
-            pass
-    meta["download"] = True
-    try:
-        zwd.upload_file("meta.json", json.dumps(meta).encode(), crop_folder_id)
-    except Exception as e:
-        print(f"[ZOHO] meta.json update failed: {e}")
+    _update_master_crop(state, district, crop, downloaded=True)
 
     content = zwd.download_file(file_id)
     return StreamingResponse(
