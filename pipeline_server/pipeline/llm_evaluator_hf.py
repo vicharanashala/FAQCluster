@@ -38,7 +38,7 @@ except ImportError:
 _API_URL            = os.environ.get("LLM_API_URL",   "http://100.100.108.44:8013/v1/chat/completions")
 _API_MODEL          = os.environ.get("LLM_MODEL",     "google/gemma-4-26B-A4B-it")
 _API_KEY            = os.environ.get("LLM_API_KEY",   "")
-_DISABLE_THINKING   = os.environ.get("LLM_DISABLE_THINKING", "").lower() == "true"
+_THINKING_ENABLED   = os.environ.get("LLM_THINKING_ENABLED", "false").lower() == "true"
 _SYSTEM_PROMPT = (
     "You are an agricultural question clustering expert. "
     "Answer ONLY with the single letter shown (A, B, or C). "
@@ -88,7 +88,7 @@ class LocalHFJudge:
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0,
-            **( {"thinking": {"type": "disabled"}} if _DISABLE_THINKING else {} ),
+            **( {} if _THINKING_ENABLED else {"thinking": {"type": "disabled"}} ),
         }
         for attempt in range(3):
             try:

@@ -541,6 +541,10 @@ def main():
             gid      = g.get('group_id', len(uq_rows) + 1)
             uq_id    = f"{int(cid)}_{gid}"
 
+            # Top 5 distinct questions by frequency — used by Stage 7 to ground answers
+            top_qs = sorted(set(group_qs), key=lambda q: freq_map.get(q, 0), reverse=True)[:5]
+            sample_questions = " | ".join(top_qs)
+
             uq_rows.append(dict(
                 unique_q_id              = uq_id,
                 cluster_id               = int(cid),
@@ -549,6 +553,7 @@ def main():
                 group_id_in_cluster      = gid,
                 answer_label             = g['answer_label'],
                 representative_question  = rep_q,
+                sample_questions         = sample_questions,
                 n_questions_in_group     = len(group_qs),
                 raw_frequency            = raw_freq,
                 pct_of_cluster_volume    = round(raw_freq / c_vol * 100, 2) if c_vol > 0 else 0.0,
@@ -585,9 +590,9 @@ def main():
     print(f"  → {uq_out}  ({len(uq_df)} groups)")
 
     # unique_questions_freq.csv — key output: rank by frequency, clean columns
-    freq_cols = ['rank', 'unique_q_id', 'representative_question', 'raw_frequency',
-                 'cluster_id', 'cluster_rank', 'cluster_label', 'answer_label',
-                 'n_questions_in_group', 'pct_of_cluster_volume']
+    freq_cols = ['rank', 'unique_q_id', 'representative_question', 'sample_questions',
+                 'raw_frequency', 'cluster_id', 'cluster_rank', 'cluster_label',
+                 'answer_label', 'n_questions_in_group', 'pct_of_cluster_volume']
     freq_df = uq_df.copy()
     freq_df = freq_df.sort_values('raw_frequency', ascending=False).reset_index(drop=True)
     freq_df.insert(0, 'rank', range(1, len(freq_df)+1))

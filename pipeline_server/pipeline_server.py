@@ -1096,6 +1096,68 @@ def download_file(path: str):
     )
 
 
+def _master_remove_folder(path: str) -> None:
+    """Remove entries from _master_data for an outputs/repair path and re-upload master.json.
+
+    Handles crop, district, or state level deletions.
+    Caller must NOT hold _master_lock.
+    """
+    parts = [p for p in path.split("/") if p]
+    # Must be under outputs/repair/
+    if len(parts) < 3 or parts[0] != "outputs" or parts[1] != "repair":
+        return
+    with _master_lock:
+        if len(parts) == 5:  # outputs/repair/<state>/<district>/<crop>
+            state, district, crop = parts[2], parts[3], parts[4]
+            if state in _master_data and district in _master_data[state]:
+                _master_data[state][district].pop(crop, None)
+                if not _master_data[state][district]:
+                    _master_data[state].pop(district, None)
+                if not _master_data[state]:
+                    _master_data.pop(state, None)
+        elif len(parts) == 4:  # outputs/repair/<state>/<district>
+            state, district = parts[2], parts[3]
+            if state in _master_data:
+                _master_data[state].pop(district, None)
+                if not _master_data[state]:
+                    _master_data.pop(state, None)
+        elif len(parts) == 3:  # outputs/repair/<state>
+            _master_data.pop(parts[2], None)
+        else:
+            return  # nothing to do
+        try:
+            _upload_master_json()
+        except Exception as e:
+            print(f"[MASTER] Failed to upload master.json after folder delete: {e}")
+
+
+def _master_clear_file(path: str) -> None:
+    """Clear output_file or audit_file references in _master_data when a file is deleted."""
+    parts = [p for p in path.split("/") if p]
+    # outputs/repair/<state>/<district>/<crop>/<filename>
+    if len(parts) != 6 or parts[0] != "outputs" or parts[1] != "repair":
+        return
+    state, district, crop, fname = parts[2], parts[3], parts[4], parts[5]
+    with _master_lock:
+        entry = _master_data.get(state, {}).get(district, {}).get(crop)
+        if entry is None:
+            return
+        changed = False
+        if entry.get("output_file", "").endswith(f"/{fname}"):
+            entry["output_file"] = None
+            entry["processed"] = False
+            changed = True
+        if entry.get("audit_file", "").endswith(f"/{fname}"):
+            entry["audit_file"] = None
+            entry["audited"] = False
+            changed = True
+        if changed:
+            try:
+                _upload_master_json()
+            except Exception as e:
+                print(f"[MASTER] Failed to upload master.json after file delete: {e}")
+
+
 @app.delete("/files/{path:path}")
 def delete_file(path: str):
     _resolve_safe(path)
@@ -1109,6 +1171,8 @@ def delete_file(path: str):
     if not zwd.delete(file_id):
         raise HTTPException(status_code=502, detail="Zoho delete failed")
 
+    _master_clear_file(path)
+
     # Also delete linked base file when a dedup_/phase_ prefixed file is deleted
     name = Path(path).name
     for prefix in ("dedup_", "phase_"):
@@ -1117,6 +1181,7 @@ def delete_file(path: str):
             base_result = zwd.resolve_path(base_path)
             if base_result:
                 zwd.delete(base_result[0])
+            _master_clear_file(base_path)
             break
 
     return {"deleted": path}
@@ -1134,6 +1199,7 @@ def delete_folder(path: str):
         raise HTTPException(status_code=400, detail="path is not a directory")
     if not zwd.delete(file_id):
         raise HTTPException(status_code=502, detail="Zoho delete failed")
+    _master_remove_folder(path)
     return {"deleted": path}
 
 

@@ -34,9 +34,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_system_prompt(crop_name: str, other_crops: list = None) -> str:
-    """Build the system prompt for FAQ generation, with crop-specific hints."""
+    """Build the system prompt for FAQ generation."""
 
-    # ── Other-crop rejection list ────────────────────────────────────────────
     DEFAULT_OTHER_CROPS = [
         "Wheat", "Paddy", "Rice", "Sugarcane", "Potato", "Mustard", "Mango",
         "Black Gram", "Urad", "Mentha", "Mint", "Maize", "Chillies", "Tomato",
@@ -47,7 +46,6 @@ def get_system_prompt(crop_name: str, other_crops: list = None) -> str:
         "Apple", "Banana", "Arecanut", "Coconut", "Pigeon Pea",
     ]
 
-    # Handle common synonyms to avoid rejecting valid queries for the same crop
     synonyms = {
         "pearl millet": ["pearl millet", "bajra"],
         "bajra": ["pearl millet", "bajra"],
@@ -237,10 +235,12 @@ The final output (CATEGORY, QUESTION, and ANSWER) MUST be written EXCLUSIVELY in
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📝 GENERATION GUIDELINES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. **QUESTION**: Translate the "Representative Question" into formal English ONLY.
-   - DO NOT add, remove, or change any information or detail present in the original.
-   - DO NOT expand it, rephrase the meaning, or align it to the Cluster Topic.
-   - The ONLY allowed change is: translate to formal English. Nothing else.
+1. **QUESTION**: Rewrite the "Representative Question" as a clear, professional English FAQ question.
+   - If it is in Hindi, Hinglish, or mixed language: translate it accurately to formal English.
+   - If it is already in English: correct grammar and remove filler words only.
+   - CRITICAL: Preserve the EXACT topic and specificity of the original — do NOT add conditions, constraints, or qualifiers not present in the representative question.
+   - If the original says "wheat varieties", the question must be about wheat varieties generally — do NOT expand to "high-yielding disease-resistant varieties for specific agro-climatic zones".
+   - DO NOT align it to the Cluster Topic if they differ. Follow the Representative Question faithfully.
 2. **ANSWER (200–400 words)**:
    - Must be written entirely in English.
    - Step-by-step technical guide using clear headings or bullet points.
@@ -261,7 +261,7 @@ Output EXACTLY in this format with these three headers.
 Even if the user query is in Hindi, the response below MUST be in ENGLISH.
 
 CATEGORY: [Classification]
-QUESTION: [Formal English translation of the Representative Question — no additions]
+QUESTION: [Professional English rewrite of the Representative Question — same meaning, no additions]
 ANSWER:
 [The detailed technical answer in English...]
 """
@@ -340,7 +340,7 @@ except ImportError:
 _API_URL            = _os.environ.get("LLM_API_URL",   "http://100.100.108.44:8013/v1/chat/completions")
 _API_MODEL          = _os.environ.get("LLM_MODEL",     "google/gemma-4-26B-A4B-it")
 _API_KEY            = _os.environ.get("LLM_API_KEY",   "")
-_DISABLE_THINKING   = _os.environ.get("LLM_DISABLE_THINKING", "").lower() == "true"
+_THINKING_ENABLED   = _os.environ.get("LLM_THINKING_ENABLED", "false").lower() == "true"
 
 
 def _call_api(session, messages: list, max_tokens: int = 4000) -> str:
@@ -349,7 +349,7 @@ def _call_api(session, messages: list, max_tokens: int = 4000) -> str:
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.0,
-        **( {"thinking": {"type": "disabled"}} if _DISABLE_THINKING else {} ),
+        **( {} if _THINKING_ENABLED else {"thinking": {"type": "disabled"}} ),
     }
     if _API_KEY:
         session.headers.update({"Authorization": f"Bearer {_API_KEY}"})
@@ -370,16 +370,31 @@ def _process_row(args):
     freq          = row.get('count', row.get('raw_frequency', 1))
     cluster_label = str(row.get('cluster_label', '')).strip()
     answer_label  = str(row.get('answer_label',  '')).strip()
-    # answer_label is the specific answer-distinct topic from unique_question_finder;
-    # cluster_label is the broader cluster topic — use answer_label when available.
+    # answer_label is the specific answer-distinct topic; cluster_label is broader
     topic = answer_label if answer_label and answer_label != cluster_label else cluster_label
-    user_msg = prefix + f"""
-Generate a {crop} FAQ entry based on:
-- Cluster Topic: {topic}
-- Representative Question: {question}
-- Freq: {freq}
 
-The "Cluster Topic" is the authoritative subject. Reframe the "Representative Question" to match the Cluster Topic if they differ.
+    # Sample questions from the group (pipe-separated, produced by Stage 5)
+    raw_samples = str(row.get('sample_questions', '') or '').strip()
+    if raw_samples:
+        samples = [q.strip() for q in raw_samples.split('|') if q.strip()]
+    else:
+        samples = [question]
+    # Deduplicate while preserving order, cap at 5
+    seen_s, deduped = set(), []
+    for q in samples:
+        if q.lower() not in seen_s:
+            seen_s.add(q.lower())
+            deduped.append(q)
+    samples = deduped[:5]
+
+    sample_lines = "\n".join(f"  - {q}" for q in samples)
+    user_msg = prefix + f"""Generate a {crop} FAQ entry.
+
+Cluster Topic (for context only): {topic}
+Representative Question: {question}
+
+Actual farmer questions in this group (base your answer on ONLY what these ask):
+{sample_lines}
 """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -433,7 +448,7 @@ def run_qa_generation(
     print(f"   API: {_API_URL} | Model: {_API_MODEL} | Workers: {workers}")
 
     system_prompt = get_system_prompt(crop)
-    prefix = "MANDATORY: Translate and generate this FAQ entry EXCLUSIVELY in English.\n\n"
+    prefix = ""
 
     print(f"\nStarting generation over {n} prompts...")
     start_time = time.time()

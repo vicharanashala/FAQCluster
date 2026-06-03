@@ -22,7 +22,7 @@ except ImportError:
 _API_URL            = os.environ.get("LLM_API_URL",   "http://100.100.108.44:8013/v1/chat/completions")
 _API_MODEL          = os.environ.get("LLM_MODEL",     "google/gemma-4-26B-A4B-it")
 _API_KEY            = os.environ.get("LLM_API_KEY",   "")
-_DISABLE_THINKING   = os.environ.get("LLM_DISABLE_THINKING", "").lower() == "true"
+_THINKING_ENABLED   = os.environ.get("LLM_THINKING_ENABLED", "false").lower() == "true"
 _CATEGORY_WORKERS   = int(os.environ.get("LLM_CLUSTER_WORKERS", "4"))
 _BATCH_WORKERS      = int(os.environ.get("LLM_BATCH_WORKERS",  "4"))
 
@@ -39,7 +39,7 @@ def llm_completion(prompt, max_tokens=200, temperature=0.0, top_p=0.95, stop=Non
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
-        **( {"thinking": {"type": "disabled"}} if _DISABLE_THINKING else {} ),
+        **( {} if _THINKING_ENABLED else {"thinking": {"type": "disabled"}} ),
     }
     if stop is not None:
         data["stop"] = stop
