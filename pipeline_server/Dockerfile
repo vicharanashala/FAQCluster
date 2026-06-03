@@ -24,6 +24,7 @@ COPY run_pre_pipeline.py  .
 COPY run_post_pipeline.py .
 COPY _job_ctl.py          .
 COPY config/              config/
+COPY helpers/             helpers/
 COPY pipeline_server.py   .
 
 RUN mkdir -p app-data outputs

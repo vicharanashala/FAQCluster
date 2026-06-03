@@ -13,6 +13,7 @@ it is refreshed automatically in-place.
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -32,6 +33,7 @@ class ZohoWorkDrive:
 
         self._access_token = ""
         self._lock = threading.Lock()
+        self._last_refresh_time: float = 0.0
         # Obtain a fresh token on startup — no file cache needed
         self._refresh_access_token()
         self._session = self._make_session()
@@ -48,8 +50,11 @@ class ZohoWorkDrive:
         s.mount("https://", HTTPAdapter(max_retries=retry))
         return s
 
-    def _refresh_access_token(self) -> bool:
+    def _refresh_access_token(self, min_interval: float = 120.0) -> bool:
         with self._lock:
+            # Skip if another thread already refreshed within the last min_interval seconds
+            if time.monotonic() - self._last_refresh_time < min_interval:
+                return True
             try:
                 resp = requests.post(
                     "https://accounts.zoho.in/oauth/v2/token",
@@ -70,6 +75,7 @@ class ZohoWorkDrive:
                 print(f"[ZOHO] Token refresh error: {data}")
                 return False
             self._access_token = new_token
+            self._last_refresh_time = time.monotonic()
             if hasattr(self, "_session"):
                 self._session.headers.update({"Authorization": f"Zoho-oauthtoken {new_token}"})
             print("[ZOHO] Access token refreshed.")
