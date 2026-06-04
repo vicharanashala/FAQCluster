@@ -199,8 +199,10 @@ def _get_verified_matches(reference_row, candidate_df, text_col, batch_size, ref
         )
         prompt = (
             f"You are given one reference question and a list of candidate questions.\n"
-            f"Task: Return ONLY the IDs of questions that are the exact same or a rephrase "
-            f"of the reference question.\n"
+            f"Task: Return ONLY the IDs of questions that are asking about the same agricultural "
+            f"issue and would receive the same answer as the reference question — even if worded "
+            f"differently, phrased as a statement vs question, or using different terminology for "
+            f"the same topic.\n"
             f"Rules:\n- Output ONLY a JSON list of matching IDs\n"
             f"- No explanation\n- If none match, return []\n\n"
             f"Reference:\n{original_id}: {original_question}\n\n"
@@ -249,8 +251,10 @@ def _get_verified_matches(reference_row, candidate_df, text_col, batch_size, ref
         f"{row['unique_q_id']}: {row[text_col]}" for _, row in candidate_rows.iterrows()
     )
     verification_prompt = (
-        f"Task: Strictly review these candidates. Remove any that are NOT the exact same "
-        f"or a direct rephrase of the reference.\n"
+        f"Task: Review these candidates. Remove only questions that are clearly about a "
+        f"different problem, chemical, or crop stage than the reference. Keep any question "
+        f"that is asking about the same agricultural issue and would receive the same answer "
+        f"as the reference.\n"
         f"Rules: Output ONLY a JSON list of matching IDs. No explanation. "
         f"If none match, return [].\n\n"
         f"Reference:\n{original_id}: {original_question}\n\n"
