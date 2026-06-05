@@ -400,6 +400,18 @@ def phase1_fast_screening(df, configs, model, stop_words):
                 candidates.append(r)
         print(f"  Relaxed screening found {len(candidates)} candidates")
 
+    # Last resort: if still no candidates, just pick the best available config by
+    # most clusters then lowest noise — better than crashing on small crops.
+    if not candidates and all_results:
+        best = max(all_results, key=lambda r: (
+            r.metrics.get('n_clusters', 0),
+            -r.metrics.get('noise_ratio', 1),
+        ))
+        candidates.append(best)
+        print(f"  Last resort: using best available config {best.config} "
+              f"({best.metrics['n_clusters']} clusters, "
+              f"noise={best.metrics['noise_ratio']:.2f})")
+
     # Save screening results
     screening_df = pd.DataFrame(results_log)
     screening_file = OUTPUT_DIR / 'phase1_screening_results.csv'

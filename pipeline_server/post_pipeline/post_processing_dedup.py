@@ -25,6 +25,7 @@ _API_KEY            = os.environ.get("LLM_API_KEY",   "")
 _THINKING_ENABLED   = os.environ.get("LLM_THINKING_ENABLED", "false").lower() == "true"
 _CATEGORY_WORKERS   = int(os.environ.get("LLM_CLUSTER_WORKERS", "4"))
 _BATCH_WORKERS      = int(os.environ.get("LLM_BATCH_WORKERS",  "4"))
+_EMBED_DEDUP_THRESH = float(os.environ.get("LLM_EMBED_DEDUP_THRESH", "0.95"))
 
 crops_folder = Path('../outputs/repair/final')
 
@@ -125,6 +126,73 @@ def _process_category(category, cat_df, text_col, batch_size, cancel_event=None)
     return final_cleaned_data, phase_data
 
 
+def embedding_prepass(df, text_col='Generated_Question', sim_thresh=_EMBED_DEDUP_THRESH):
+    """
+    Within each Generated_Category, auto-merge semantically near-identical questions
+    (cosine >= sim_thresh) using sentence embeddings — before the LLM pass runs.
+
+    Higher raw_frequency row survives; its frequency is incremented by the absorbed row's.
+    This catches cases where Q&A generation turned short/typo original questions into
+    different-looking English sentences that are semantically identical.
+    """
+    try:
+        import numpy as np
+        import torch
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        tqdm.write("  [embed-dedup] sentence_transformers not available — skipping pre-pass")
+        return df
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tqdm.write(f"  [embed-dedup] Loading sentence transformer on {device}...")
+    st_model = SentenceTransformer(
+        "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+        device=device,
+    )
+
+    all_kept = []
+    total_merged = 0
+
+    for cat in df["Generated_Category"].unique():
+        cat_df = df[df["Generated_Category"] == cat].copy().reset_index(drop=True)
+        n = len(cat_df)
+        if n <= 1:
+            all_kept.append(cat_df)
+            continue
+
+        texts = cat_df[text_col].tolist()
+        embs  = st_model.encode(texts, batch_size=64, show_progress_bar=False,
+                                convert_to_numpy=True, normalize_embeddings=True)
+        sim   = embs @ embs.T
+
+        # Process in descending frequency order so the most-asked question survives
+        order    = cat_df["raw_frequency"].argsort()[::-1].tolist()
+        absorbed = set()
+
+        for rank_i, i in enumerate(order):
+            if i in absorbed:
+                continue
+            for j in order[rank_i + 1:]:
+                if j in absorbed:
+                    continue
+                if sim[i, j] >= sim_thresh:
+                    cat_df.at[i, "raw_frequency"] += cat_df.at[j, "raw_frequency"]
+                    absorbed.add(j)
+                    total_merged += 1
+                    tqdm.write(
+                        f"  [embed-dedup] [{cat}] MERGE "
+                        f"'{cat_df.at[j, text_col][:70]}' → "
+                        f"'{cat_df.at[i, text_col][:70]}' "
+                        f"(sim={sim[i, j]:.3f})"
+                    )
+
+        all_kept.append(cat_df[~cat_df.index.isin(absorbed)].copy())
+
+    result = pd.concat(all_kept, ignore_index=True)
+    tqdm.write(f"  [embed-dedup] {len(df)} → {len(result)} rows ({total_merged} auto-merged)")
+    return result
+
+
 def deduplicate_and_aggregate(df, text_col='Generated_Question', batch_size=100, cancel_event=None):
     """
     Iterates through categories in parallel, finds similar questions using LLM,
@@ -140,6 +208,9 @@ def deduplicate_and_aggregate(df, text_col='Generated_Question', batch_size=100,
     n_dropped = n_before - len(df)
     if n_dropped:
         tqdm.write(f"  Filtered {n_dropped} rows (PARSE_ERROR / IRRELEVANT_CROP / empty question) before dedup")
+
+    tqdm.write("\n[Embedding pre-pass] Auto-merging near-identical questions by embedding similarity...")
+    df = embedding_prepass(df, text_col=text_col)
 
     categories = df['Generated_Category'].unique()
     n_workers  = min(len(categories), _CATEGORY_WORKERS)
@@ -199,10 +270,14 @@ def _get_verified_matches(reference_row, candidate_df, text_col, batch_size, ref
         )
         prompt = (
             f"You are given one reference question and a list of candidate questions.\n"
-            f"Task: Return ONLY the IDs of questions that are asking about the same agricultural "
-            f"issue and would receive the same answer as the reference question — even if worded "
-            f"differently, phrased as a statement vs question, or using different terminology for "
-            f"the same topic.\n"
+            f"Task: Return ONLY the IDs of questions that are the same question as the reference "
+            f"— same topic, same type of information requested, and same level of specificity.\n"
+            f"A candidate is a match ONLY if a farmer asking the reference question and a farmer "
+            f"asking the candidate question would both be satisfied by the exact same answer.\n"
+            f"DO NOT flag a candidate if it differs in any of these ways:\n"
+            f"- Adds or removes a qualifier (season, crop stage, growth stage, region)\n"
+            f"- Asks about a specific chemical/variety/pest while the reference is general, or vice versa\n"
+            f"- Asks for a different type of information (e.g. identification vs treatment vs dosage vs timing)\n"
             f"Rules:\n- Output ONLY a JSON list of matching IDs\n"
             f"- No explanation\n- If none match, return []\n\n"
             f"Reference:\n{original_id}: {original_question}\n\n"
@@ -251,10 +326,13 @@ def _get_verified_matches(reference_row, candidate_df, text_col, batch_size, ref
         f"{row['unique_q_id']}: {row[text_col]}" for _, row in candidate_rows.iterrows()
     )
     verification_prompt = (
-        f"Task: Review these candidates. Remove only questions that are clearly about a "
-        f"different problem, chemical, or crop stage than the reference. Keep any question "
-        f"that is asking about the same agricultural issue and would receive the same answer "
-        f"as the reference.\n"
+        f"Task: Strictly verify these candidates against the reference. Keep a candidate ONLY "
+        f"if it is asking the exact same question with the same scope and specificity — "
+        f"just worded differently.\n"
+        f"Remove a candidate if it differs in ANY of the following:\n"
+        f"- The season, crop stage, or growth stage (e.g. 'summer' vs 'Rabi', 'seedling' vs 'flowering')\n"
+        f"- The level of specificity (one names a specific variety/chemical/pest, the other does not)\n"
+        f"- The type of information asked (identification/symptoms vs treatment vs dosage vs timing vs selection)\n"
         f"Rules: Output ONLY a JSON list of matching IDs. No explanation. "
         f"If none match, return [].\n\n"
         f"Reference:\n{original_id}: {original_question}\n\n"
