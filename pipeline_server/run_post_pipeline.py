@@ -32,8 +32,35 @@ try:
 except ImportError:
     _ctl = None
 
-SOURCE_FILE = "unique_questions_freq_qa.csv"
-PHASE_OUT   = "phase_data_faq.csv"
+try:
+    from helpers.zoho_workdrive import ZohoWorkDrive as _ZohoWorkDrive
+    _ZOHO_AVAILABLE = True
+except Exception:
+    _ZOHO_AVAILABLE = False
+
+SOURCE_FILE  = "unique_questions_freq_qa.csv"
+MAPPING_FILE = "unique_question_mapping.csv"
+PHASE_OUT    = "phase_data_faq.csv"
+
+
+def _zoho_push(zwd, zoho_rel: str, *files) -> None:
+    """Upload specific files to a Zoho folder path."""
+    if zwd is None or not zoho_rel:
+        return
+    try:
+        parent_id = zwd.ensure_path(zoho_rel)
+    except Exception as e:
+        print(f"  [ZOHO] ensure_path failed for {zoho_rel}: {e}")
+        return
+    for f in files:
+        f = Path(f)
+        if not f.exists():
+            continue
+        try:
+            zwd.upload_file(f.name, f.read_bytes(), parent_id)
+            print(f"  [ZOHO] ↑ {f.name}")
+        except Exception as e:
+            print(f"  [ZOHO] upload failed for {f.name}: {e}")
 
 
 def _slug(name: str) -> str:
@@ -47,7 +74,54 @@ def banner(msg: str):
     print(f"{'═' * width}")
 
 
-def run_dedup(input_dir: Path, crops: list | None = None):
+def run_review(input_dir: Path, crops: list | None = None, zwd=None) -> None:
+    """Generate review CSVs (Generated_Question + all farmer questions) per crop and upload to Zoho."""
+    from post_pipeline.generate_review_file import generate_review
+
+    banner("Review File Generation")
+    crop_slugs = {_slug(c) for c in crops} if crops else None
+
+    crop_dirs = sorted(
+        d for d in input_dir.iterdir()
+        if d.is_dir() and d.name != 'final'
+        and (crop_slugs is None or d.name in crop_slugs)
+    )
+
+    if not crop_dirs:
+        print(f"  No matching crop folders found in {input_dir}")
+        return
+
+    for crop_dir in crop_dirs:
+        # Prefer the final deduped file; fall back to unique_questions_freq_qa.csv
+        dedup_name = f"{input_dir.name}_{crop_dir.name}.csv"
+        qa_csv = crop_dir / dedup_name
+        if not qa_csv.exists():
+            qa_csv = crop_dir / SOURCE_FILE
+        if not qa_csv.exists():
+            print(f"  [SKIP] {crop_dir.name}: no QA csv found")
+            continue
+
+        map_csv = crop_dir / MAPPING_FILE
+        if not map_csv.exists():
+            print(f"  [SKIP] {crop_dir.name}: {MAPPING_FILE} not found")
+            continue
+
+        review_name = f"{input_dir.name}_{crop_dir.name}_review.csv"
+        review_csv  = crop_dir / review_name
+
+        try:
+            generate_review(qa_csv, map_csv, review_csv)
+        except Exception as e:
+            print(f"  [ERROR] {crop_dir.name}: review generation failed: {e}")
+            continue
+
+        zoho_rel = f"outputs/repair/{input_dir.name}/{crop_dir.name}"
+        _zoho_push(zwd, zoho_rel, review_csv)
+
+    print(f"\n  ✓ Review files complete")
+
+
+def run_dedup(input_dir: Path, crops: list | None = None, zwd=None):
     """Run LLM dedup on each crop subfolder of *input_dir*.
 
     Args:
@@ -55,6 +129,7 @@ def run_dedup(input_dir: Path, crops: list | None = None):
         crops:     optional list of crop names (original form, e.g. ["Rice"]).
                    When given, only folders whose slug matches are processed.
                    When None/empty, all crop subfolders are processed.
+        zwd:       ZohoWorkDrive instance (optional); uploads dedup output if provided.
     """
     banner("LLM Deduplication (Gemma-4-26B)")
     import pandas as pd
@@ -101,6 +176,9 @@ def run_dedup(input_dir: Path, crops: list | None = None):
         print(f"  Saved: {crop_dir.name}/{PHASE_OUT}")
         print(f"  Saved: {crop_dir.name}/{dedup_out_name}")
 
+        zoho_rel = f"outputs/repair/{input_dir.name}/{crop_dir.name}"
+        _zoho_push(zwd, zoho_rel, crop_dir / dedup_out_name, crop_dir / PHASE_OUT)
+
     print(f"\n  ✓ Deduplication complete")
 
 
@@ -127,6 +205,10 @@ def parse_args():
     ctrl = parser.add_argument_group('Pipeline control')
     ctrl.add_argument('--skip-dedup', action='store_true',
                       help='Skip LLM deduplication')
+    ctrl.add_argument('--skip-review', action='store_true',
+                      help='Skip review file generation (and Zoho upload)')
+    ctrl.add_argument('--no-zoho', action='store_true',
+                      help='Disable Zoho upload even if credentials are available')
     return parser.parse_args()
 
 
@@ -146,10 +228,24 @@ def main():
         print(f"  Crops      : (all)")
     print(f"  Started    : {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
+    # Init Zoho once so both dedup and review can upload
+    zwd = None
+    if _ZOHO_AVAILABLE and not args.no_zoho:
+        try:
+            zwd = _ZohoWorkDrive()
+            print("  Zoho       : connected")
+        except Exception as ze:
+            print(f"  Zoho       : init failed — running local only ({ze})")
+
     if args.skip_dedup:
         print("\n[--skip-dedup] Skipping LLM deduplication")
     else:
-        run_dedup(input_dir, args.crops or None)
+        run_dedup(input_dir, args.crops or None, zwd=zwd)
+
+    if args.skip_review:
+        print("\n[--skip-review] Skipping review file generation")
+    else:
+        run_review(input_dir, args.crops or None, zwd=zwd)
 
     elapsed = datetime.now() - start_time
     banner("Post-Pipeline Complete!")

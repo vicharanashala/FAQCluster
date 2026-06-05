@@ -128,12 +128,11 @@ def _process_category(category, cat_df, text_col, batch_size, cancel_event=None)
 
 def embedding_prepass(df, text_col='Generated_Question', sim_thresh=_EMBED_DEDUP_THRESH):
     """
-    Within each Generated_Category, auto-merge semantically near-identical questions
+    Across all rows, auto-merge semantically near-identical questions
     (cosine >= sim_thresh) using sentence embeddings — before the LLM pass runs.
 
     Higher raw_frequency row survives; its frequency is incremented by the absorbed row's.
-    This catches cases where Q&A generation turned short/typo original questions into
-    different-looking English sentences that are semantically identical.
+    When two rows merge, the survivor keeps its own Generated_Category.
     """
     try:
         import numpy as np
@@ -150,45 +149,38 @@ def embedding_prepass(df, text_col='Generated_Question', sim_thresh=_EMBED_DEDUP
         device=device,
     )
 
-    all_kept = []
+    work_df = df.copy().reset_index(drop=True)
     total_merged = 0
 
-    for cat in df["Generated_Category"].unique():
-        cat_df = df[df["Generated_Category"] == cat].copy().reset_index(drop=True)
-        n = len(cat_df)
-        if n <= 1:
-            all_kept.append(cat_df)
+    texts = work_df[text_col].tolist()
+    embs  = st_model.encode(texts, batch_size=64, show_progress_bar=True,
+                            convert_to_numpy=True, normalize_embeddings=True)
+    sim   = embs @ embs.T
+
+    # Process in descending frequency order so the most-asked question survives
+    order    = work_df["raw_frequency"].argsort()[::-1].tolist()
+    absorbed = set()
+
+    for rank_i, i in enumerate(order):
+        if i in absorbed:
             continue
-
-        texts = cat_df[text_col].tolist()
-        embs  = st_model.encode(texts, batch_size=64, show_progress_bar=False,
-                                convert_to_numpy=True, normalize_embeddings=True)
-        sim   = embs @ embs.T
-
-        # Process in descending frequency order so the most-asked question survives
-        order    = cat_df["raw_frequency"].argsort()[::-1].tolist()
-        absorbed = set()
-
-        for rank_i, i in enumerate(order):
-            if i in absorbed:
+        cat_i = work_df.at[i, "Generated_Category"]
+        for j in order[rank_i + 1:]:
+            if j in absorbed:
                 continue
-            for j in order[rank_i + 1:]:
-                if j in absorbed:
-                    continue
-                if sim[i, j] >= sim_thresh:
-                    cat_df.at[i, "raw_frequency"] += cat_df.at[j, "raw_frequency"]
-                    absorbed.add(j)
-                    total_merged += 1
-                    tqdm.write(
-                        f"  [embed-dedup] [{cat}] MERGE "
-                        f"'{cat_df.at[j, text_col][:70]}' → "
-                        f"'{cat_df.at[i, text_col][:70]}' "
-                        f"(sim={sim[i, j]:.3f})"
-                    )
+            if sim[i, j] >= sim_thresh:
+                cat_j = work_df.at[j, "Generated_Category"]
+                work_df.at[i, "raw_frequency"] += work_df.at[j, "raw_frequency"]
+                absorbed.add(j)
+                total_merged += 1
+                tqdm.write(
+                    f"  [embed-dedup] [{cat_j}→{cat_i}] MERGE "
+                    f"'{work_df.at[j, text_col][:70]}' → "
+                    f"'{work_df.at[i, text_col][:70]}' "
+                    f"(sim={sim[i, j]:.3f})"
+                )
 
-        all_kept.append(cat_df[~cat_df.index.isin(absorbed)].copy())
-
-    result = pd.concat(all_kept, ignore_index=True)
+    result = work_df[~work_df.index.isin(absorbed)].copy().reset_index(drop=True)
     tqdm.write(f"  [embed-dedup] {len(df)} → {len(result)} rows ({total_merged} auto-merged)")
     return result
 
