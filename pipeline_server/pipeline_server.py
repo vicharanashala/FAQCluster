@@ -1446,6 +1446,7 @@ def _build_master_data_from_zoho() -> dict:
                     "downloaded": False,
                     "audited": False,
                     "processed": output_file is not None,
+                    "finished_at": None,
                 }
 
     return data
@@ -1490,6 +1491,8 @@ def _update_master_crop(state: str, district: str, crop: str, **updates) -> None
     """Update a single crop entry in memory and re-upload master.json."""
     with _master_lock:
         entry = _master_data.setdefault(state, {}).setdefault(district, {}).setdefault(crop, {})
+        if updates.get("processed") and not entry.get("finished_at"):
+            updates["finished_at"] = datetime.now(timezone.utc).isoformat()
         entry.update(updates)
         try:
             _upload_master_json()
@@ -1513,6 +1516,7 @@ def _master_to_rows() -> list[dict]:
                     "downloaded": d.get("downloaded", False),
                     "audited": d.get("audited", False),
                     "processed": d.get("processed", False),
+                    "finished_at": d.get("finished_at"),
                 })
     return rows
 
