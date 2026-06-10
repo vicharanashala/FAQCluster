@@ -909,6 +909,10 @@ def _run_full_sync(r: FullRequest) -> None:
             # run_pipeline.py already uploads all intermediate files per-stage.
             # Only upload the 2 files post-pipeline writes.
             crop_slug = slug(crop)
+            final_csv = crop_out / f"{district_folder}_{crop_slug}.csv"
+            if not final_csv.exists():
+                final_csv.touch()
+                print(f"[INFO] No output produced for '{crop}' — created empty placeholder {final_csv.name}")
             for fname in ["phase_data_faq.csv", f"{district_folder}_{crop_slug}.csv"]:
                 _zoho_sync_up(crop_out / fname)
             shutil.rmtree(crop_out, ignore_errors=True)

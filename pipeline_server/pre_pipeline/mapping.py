@@ -163,7 +163,7 @@ crop_mapping = {
     "Capsicum": "Capsicum",
     "Chillies": "Chillies",
     "Bell Pepper": "Chillies",
-    "Pepper": "Chillies",
+    "Pepper": "Pepper",
     "Carrot": "Carrot",
     "Radish": "Radish",
     "Turnip Saljam": "Turnip",

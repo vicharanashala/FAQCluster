@@ -4,171 +4,182 @@ FAQCluster is deployed as two Docker containers orchestrated by Docker Compose, 
 
 ---
 
-## Container Overview
+## Docker Compose
 
-| Image | Role | Exposed port |
-|---|---|---|
-| `vicharanashala/faqcluster-pipeline` | FastAPI pipeline server + ML models | `7000` (host network) |
-| `vicharanashala/faqcluster-frontend` | React UI served by nginx | `8030` (public) |
-| POP server *(planned)* | POP-Translation FastAPI server | `8000` (separate VM) |
+**File:** `docker-compose.yml`
 
-The pipeline container uses `network_mode: host`, so port 7000 is accessible directly on the host. The frontend reaches the pipeline via the host's Tailscale IP. The only port that needs to be opened in the VM firewall for end users is `8030`.
+### Services
 
----
-
-## Prerequisites (production VM)
-
-```bash
-# Docker Engine
-curl -fsSL https://get.docker.com | sh
-
-# Docker Compose plugin
-sudo apt-get install -y docker-compose-plugin
-
-# NVIDIA Container Toolkit (only if GPU available)
-distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
-curl -s -L https://nvidia.github.io/libnvidia-container/gpgkey | sudo apt-key add -
-curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list \
-  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
-sudo systemctl restart docker
-```
-
----
-
-## Deploying
-
-Before deploying, set the Tailscale IPs in `docker-compose.yml`:
+#### `pipeline` — ML backend
 
 ```yaml
-environment:
-  - FAQ_API_URL=http://<pipeline-tailscale-ip>:7000
-  - POP_API_URL=http://<pop-server-tailscale-ip>:8000
+image: vicharanashala/faqcluster-pipeline:latest
+network_mode: host
+expose:
+  - "8031"
 ```
 
-Copy `docker-compose.yml` to the production VM (no source code needed):
+- Runs with `network_mode: host` so the pipeline can reach the LLM inference server at `100.100.108.44:8013` over Tailscale without NAT.
+- Requires GPU: reserved via `deploy.resources.reservations.devices` (driver `nvidia`, capabilities `[gpu]`).
+- All secrets injected from `.env` file (not baked into the image).
+- Healthcheck: `python -c "import urllib.request; urllib.request.urlopen('http://localhost:8031/')"` every 15 seconds, 5 retries, 30s start period.
+- Mounts `./pipeline_server/app-data:/app/pipeline_server/app-data` as a named volume for local scratch.
 
-```bash
-scp docker-compose.yml user@prod-vm:~/faqcluster/
-```
-
-On the VM:
-
-```bash
-cd ~/faqcluster
-docker compose pull          # pull latest images from DockerHub
-docker compose up -d         # start both containers in background
-```
-
-Access the UI at `http://<vm-ip>:8030`.
-
----
-
-## Updating to a new version
-
-```bash
-docker compose pull
-docker compose up -d --force-recreate
-```
-
-Data volumes (`app-data`, `outputs`) persist across updates automatically.
-
----
-
-## Environment Variables
-
-Set in `docker-compose.yml`:
-
-| Variable | Service | Description |
-|---|---|---|
-| `FAQ_API_URL` | `frontend` | Tailscale URL of the pipeline container (e.g. `http://100.x.x.x:7000`) |
-| `POP_API_URL` | `frontend` | Tailscale URL of the POP server (e.g. `http://100.x.x.x:8000`) |
-| `CUDA_VISIBLE_DEVICES` | `pipeline` | GPU index (default: `0`) |
-
-The frontend reads `FAQ_API_URL` and `POP_API_URL` at nginx startup and injects them into the served HTML as `window.__FAQ_API_URL__` and `window.__POP_API_URL__`.
-
----
-
-## Changing the public port
-
-If port `8030` is taken, change the `ports` mapping in `docker-compose.yml`:
+#### `frontend` — React UI
 
 ```yaml
+image: vicharanashala/faqcluster-frontend:latest
 ports:
-  - "9090:80"   # expose on VM port 9090 instead
+  - "8030:80"
+depends_on:
+  pipeline:
+    condition: service_healthy
 ```
 
-The internal nginx port (`80`) never changes — only the host-side binding does.
+- Nginx container serving the compiled React SPA.
+- Only starts after the pipeline healthcheck passes.
+- Proxies `/api/` to `http://localhost:8031` (pipeline server).
 
 ---
 
-## Persistent Data
+## Environment Variables (`.env`)
 
-Two named Docker volumes store data across container restarts and image updates:
+The `.env` file at the repo root is loaded by the pipeline container at startup (via `python-dotenv`). It is **not committed to git** — copy and fill in before deploying.
 
-| Volume | Mounted at (pipeline container) | Contents |
-|---|---|---|
-| `app-data` | `/app/app-data` | Uploaded CSVs, normalised data |
-| `outputs` | `/app/outputs` | Pipeline results, FAQ CSVs |
-
-To back up data:
 ```bash
-docker run --rm \
-  -v faqcluster_outputs:/data \
-  -v $(pwd):/backup \
-  alpine tar czf /backup/outputs-backup.tar.gz /data
+# Zoho WorkDrive — OAuth2 credentials
+ZOHO_CLIENT_ID=<from Zoho API Console>
+ZOHO_CLIENT_SECRET=<from Zoho API Console>
+ZOHO_REFRESH_TOKEN=<exchange code for this once>
+ZOHO_ROOT_FOLDER_ID=<the long ID from your WorkDrive folder link>
+
+# LLM inference (optional overrides — defaults work for prod VM)
+LLM_API_URL=http://100.100.108.44:8013/v1/chat/completions
+LLM_MODEL=google/gemma-4-26B-A4B-it
+LLM_API_KEY=
+LLM_THINKING_ENABLED=false
+LLM_GROUPING_STRICTNESS=strict
 ```
+
+### Getting Zoho credentials
+
+1. Go to [https://api-console.zoho.in](https://api-console.zoho.in) and create a Self Client.
+2. Generate a code with scope `WorkDrive.files.ALL`.
+3. Exchange the code for a refresh token using:
+   ```bash
+   curl -X POST "https://accounts.zoho.in/oauth/v2/token" \
+     -d "grant_type=authorization_code&client_id=...&client_secret=...&code=..."
+   ```
+4. Copy `refresh_token` from the response into `.env`.
+5. The `ZOHO_ROOT_FOLDER_ID` is the long alphanumeric ID in the URL when you navigate to your WorkDrive folder.
+
+---
+
+## Production Deployment Steps
+
+```bash
+# 1. SSH into the GPU VM
+ssh <vm-ip>
+
+# 2. Clone the repo (first time only)
+git clone <repo-url>
+cd FAQCluster
+
+# 3. Create .env with credentials
+cp .env.example .env
+nano .env
+
+# 4. Pull latest images
+docker compose pull
+
+# 5. Start services
+docker compose up -d
+
+# 6. Check logs
+docker compose logs -f pipeline
+```
+
+After startup:
+- Frontend: `http://<vm-ip>:8030`
+- Pipeline API: `http://<vm-ip>:8031`
+
+---
+
+## Dockerfile (pipeline service)
+
+**File:** `pipeline_server/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app/pipeline_server
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
+
+COPY . .
+
+EXPOSE 8031
+CMD ["uvicorn", "pipeline_server:app", "--host", "0.0.0.0", "--port", "8031"]
+```
+
+Key notes:
+- Uses `python:3.11-slim` — the SentenceTransformer / HDBSCAN GPU dependencies are installed via `requirements.lock` (pinned versions).
+- No `--reload` in production CMD — the Dockerfile CMD is for production; use `--reload` only in dev.
+- The GPU is accessed via the CUDA toolkit from the host NVIDIA driver (not installed in the image itself — NVIDIA Container Toolkit on the host handles this).
 
 ---
 
 ## GitHub Actions CI/CD
 
-Two workflows in `.github/workflows/` automatically build and push images on every push to `main`:
+**File:** `.github/workflows/build-pipeline.yml`
 
-| Workflow | Triggers on changes to | Image pushed |
-|---|---|---|
-| `build-pipeline.yml` | `pipeline_server/**` | `vicharanashala/faqcluster-pipeline` |
-| `build-frontend.yml` | `frontend/**` | `vicharanashala/faqcluster-frontend` |
+Triggers on push to `main` or `server` when any file under `pipeline_server/**` changes.
 
-### GitHub Secrets required
+Steps:
+1. Log in to Docker Hub using `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` repository secrets.
+2. Build `pipeline_server/Dockerfile`.
+3. Push two tags:
+   - `vicharanashala/faqcluster-pipeline:latest`
+   - `vicharanashala/faqcluster-pipeline:<git-sha>`
 
-| Secret | Value |
-|---|---|
-| `DOCKERHUB_USERNAME` | DockerHub username for the Vicharana Shala organisation |
-| `DOCKERHUB_TOKEN` | DockerHub access token (generate at hub.docker.com → Account Settings → Security) |
-
-Once the secrets are set, any push to `main` touching the relevant paths will automatically build and push the updated image. The production VM just needs `docker compose pull && docker compose up -d` to pick up the new image.
+The frontend is built and pushed by a separate workflow (not in this repo).
 
 ---
 
-## Running without GPU
+## Hardware Requirements
 
-Remove the `deploy.resources` block from the `pipeline` service in `docker-compose.yml`:
+The pipeline container requires an NVIDIA GPU with CUDA support.
 
-```yaml
-  pipeline:
-    image: vicharanashala/faqcluster-pipeline:latest
-    expose: ["7000"]
-    environment:
-      - CUDA_VISIBLE_DEVICES=""
-    volumes:
-      - app-data:/app/app-data
-      - outputs:/app/outputs
-    network_mode: host
-    # deploy.resources block removed
-```
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU VRAM | 8 GB | 24 GB+ |
+| RAM | 16 GB | 32 GB+ |
+| Disk (scratch) | 20 GB | 50 GB |
+| Network | Tailscale VPN to LLM host | Same |
 
-The pipeline will run on CPU (significantly slower for large datasets).
+Stages 1–3 use the GPU intensively (SentenceTransformer + UMAP). The LLM inference server (`100.100.108.44:8013`) runs separately and handles Stages 2, 3B–D, 4 (local mode), and 7.
 
 ---
 
-## Local development (no Docker)
+## Local Development
 
 ```bash
-# Pipeline server
 cd pipeline_server
-uvicorn pipeline_server:app --host 0.0.0.0 --port 7000
 
-# Frontend dev server (in a separate terminal)
-cd frontend && npm run dev   # proxies /api calls to localhost:7000
+# Create venv
+python -m venv ../venv
+source ../venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.lock
+
+# Set env vars (or create .env in FAQCluster/ root)
+export ZOHO_CLIENT_ID=...
+export ZOHO_REFRESH_TOKEN=...
+...
+
+# Run server with auto-reload
+uvicorn pipeline_server:app --host 0.0.0.0 --port 8031 --reload
 ```
+
+The server will try to connect to Zoho on first request. If Zoho is unreachable, all file/run routes return HTTP 503.

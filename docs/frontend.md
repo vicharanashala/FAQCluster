@@ -2,176 +2,139 @@
 
 The frontend is a **React 18 + Vite** single-page application that provides a UI for running pipelines, monitoring jobs, browsing outputs, and managing POP translations.
 
-**Location**: `frontend/`
-**Dev server**: `npm run dev` (proxies FAQ API calls to the pipeline server on port `7000`)
-**Build**: `npm run build` → `dist/` (served by nginx in production)
+It runs as a separate Docker container (`vicharanashala/faqcluster-frontend:latest`) on port 8030, served by Nginx. All API calls go to the pipeline server on port 8031.
 
 ---
 
-## File Structure
+## Tech Stack
 
-```
-frontend/
-├── package.json
-├── vite.config.js
-├── index.html
-├── Dockerfile
-└── src/
-    ├── main.jsx                    # React root mount
-    ├── App.jsx                     # Top-level tab router
-    ├── api.js                      # All backend API calls
-    └── components/
-        ├── Header.jsx
-        ├── FunctionsPanel/
-        │   ├── FunctionsPanel.jsx      # FAQ-Cluster main UI
-        │   ├── RunTile.jsx
-        │   ├── StateTable.jsx
-        │   ├── PopStateTable.jsx
-        │   ├── ColumnFilter.jsx
-        │   └── PopTranslationPanel.jsx # POP-Translation UI
-        ├── FilesPanel/
-        │   ├── FilesPanel.jsx
-        │   ├── FileGroup.jsx
-        │   └── FileRow.jsx
-        └── JobsPanel/
-            └── JobCard.jsx
-```
+- **React 18** — UI framework
+- **Vite** — build tool
+- **Nginx** — serves the compiled SPA and proxies `/api/*` to port 8031
 
 ---
 
-## `App.jsx` — Tab Layout
+## API Contract
 
-Tabs rendered at the top level:
+The frontend talks to the pipeline server exclusively via HTTP. The base URL is configured at build time (typically `http://localhost:8031` in development, proxied via Nginx in production).
 
-| Tab | Component | Description |
-|---|---|---|
-| FAQ-Cluster | `FunctionsPanel` | Run pipeline, browse outputs |
-| POP-Translation | `PopTranslationPanel` | Translate agricultural PDFs |
+### Pipeline trigger calls
+
+```
+POST /run/full
+POST /run/pre
+POST /run/pipeline
+POST /run/post
+```
+
+All return `{job_id, job_type, status: "pending"}` immediately. The frontend polls the job status endpoint.
+
+### Job polling
+
+```
+GET /jobs                    → list all jobs
+GET /jobs/{job_id}           → single job with stdout + stderr
+POST /jobs/{job_id}/stop     → cancel
+DELETE /jobs/{job_id}        → remove from history
+```
+
+The frontend polls `GET /jobs/{job_id}` every few seconds to stream job output to the UI. `status` transitions: `pending → running → done | failed | stopped`.
+
+### State table
+
+```
+GET /app/state-table          → {status, rows}
+GET /app/state-table?refresh  → triggers Zoho rebuild, returns {status: "loading"}
+```
+
+The state table powers the main dashboard showing which state/district/crop combinations have been processed, audited, and downloaded.
+
+### File operations
+
+```
+GET  /files/tree
+GET  /files/download/{path}
+POST /files/upload
+POST /files/upload-chunk
+POST /files/rename/{path}
+DELETE /files/{path}
+DELETE /folders/{path}
+POST /files/folders
+POST /files/upload-audited
+```
+
+The file browser component uses `/files/tree` to render the Zoho WorkDrive tree and the download/delete/rename/upload endpoints for file management.
+
+### Output download
+
+```
+GET /app/output/{state}/{district}/{crop}
+```
+
+Downloads the final FAQ CSV for a state/district/crop. Marks `downloaded=True` in master.json.
+
+### Next-state helper
+
+```
+GET /app/next-state?state=&district=&domains[]=
+```
+
+Returns `{name, state, is_new, existing_crops}` — used to pre-fill the output folder name in the "Run Pipeline" form before submission.
 
 ---
 
-## `api.js` — Backend API Client
+## Main UI Views
 
-All communication is centralised in `api.js`. Two base URLs are used:
+### Dashboard / State Table
+Shows `master.json` rows as a table with columns: state, district, crop, processed, audited, downloaded. Allows downloading output CSVs and uploading audit files.
 
-```js
-const FAQ_API = window.__FAQ_API_URL__ || "http://localhost:7000";
-const POP_API = window.__POP_API_URL__ || "http://localhost:8000";
-```
+### Run Pipeline Form
+Form for triggering `/run/full`. Fields map to `FullRequest`:
+- State, district, domains (multi-select from a known list)
+- Crops (multi-select or typed)
+- Model, grid mode, GPU ID
+- Flags: skip pre/post pipeline, skip QA gen
 
-Both are injected at nginx startup from the `FAQ_API_URL` and `POP_API_URL` env vars in `docker-compose.yml`. For local dev, they fall back to `localhost:7000` and `localhost:8000`.
+The "Next State" button calls `/app/next-state` to auto-fill the output folder name.
 
-### FAQ Cluster — File Operations
+### Job Monitor
+Live log view. Shows all jobs from `/jobs`, with color-coded status and streaming stdout. Stop button calls `/jobs/{id}/stop`.
 
-| Function | HTTP | Endpoint (FAQ_API) | Description |
-|---|---|---|---|
-| `getTree()` | GET | `/files/tree` | FAQ file tree |
-| `downloadUrl(path)` | — | `/files/download/{path}` | Direct download URL |
-| `outputDownloadUrl(state, crop)` | — | `/app/output/{state}/{crop}` | Final output CSV URL |
-| `uploadFile(file, dest)` | POST | `/files/upload` or `/files/upload-chunk` | Auto-chunks files > 800 KB |
-| `deleteFile(path)` | DELETE | `/files/{path}` | Delete a file |
-| `deleteFolder(path)` | DELETE | `/folders/{path}` | Delete a folder |
-| `renameFile(from, to)` | POST | `/files/rename/{from}` | Rename or move a file |
-| `createFolder(path)` | POST | `/files/folders` | Create a directory |
-| `uploadAuditedFile(file, state, crop)` | POST | `/files/upload-audited` | Replace file with audited version |
+### File Browser
+Tree view of Zoho WorkDrive via `/files/tree`. Supports upload (chunked for large files), download, rename, move, and delete. The "upload-audited" flow uses `/files/upload-audited` which automatically names the file `audit_<original>` and updates master.json.
 
-### FAQ Cluster — Pipeline Control
+---
 
-| Function | HTTP | Endpoint (FAQ_API) | Description |
-|---|---|---|---|
-| `runPre(body)` | POST | `/run/pre` | Start pre-pipeline |
-| `runPipeline(body)` | POST | `/run/pipeline` | Start main per-crop pipeline |
-| `runPost(body)` | POST | `/run/post` | Start post-pipeline deduplication |
-| `runFull(body)` | POST | `/run/full` | Start end-to-end workflow |
+## Nginx Configuration
 
-**`runFull` body shape**:
-```js
-{
-  state: "Karnataka",
-  crops: ["Cotton", "Sugarcane"],
-  domains: [],                   // QueryType filter (optional)
-  output: "karnataka_norm",      // Output CSV name
-  model: "google/gemma-4-26B-A4B-it",
-  api_key: "",
-  gpu_id: 0,
-  batch_size: 32,
-  grid_mode: "medium",           // "quick"|"medium"|"full"|"exhaustive"
-  skip_dedup: false,
-  // ...individual stage skip flags
+Nginx serves the SPA from `/usr/share/nginx/html` and proxies API calls:
+
+```nginx
+location /api/ {
+    proxy_pass http://localhost:8031/;
 }
 ```
 
-### FAQ Cluster — App Utilities
-
-| Function | HTTP | Endpoint (FAQ_API) | Description |
-|---|---|---|---|
-| `getNextState(state, domains)` | GET | `/app/next-state` | Next versioned state folder name |
-| `getStateTable()` | GET | `/app/state-table` | State/crop output summary table |
-
-### FAQ Cluster — Job Management
-
-| Function | HTTP | Endpoint (FAQ_API) | Description |
-|---|---|---|---|
-| `getJobs()` | GET | `/jobs` | List all jobs |
-| `getJob(jobId)` | GET | `/jobs/{jobId}` | Full details: status, stdout, stderr |
-| `stopJob(jobId)` | POST | `/jobs/{jobId}/stop` | Cancel a running job |
-| `deleteJob(jobId)` | DELETE | `/jobs/{jobId}` | Remove job from history |
-
-### POP-Translation (separate POP server)
-
-All POP calls go to `POP_API` (the separate POP server):
-
-| Function | HTTP | Endpoint (POP_API) | Description |
-|---|---|---|---|
-| `getPopStates()` | GET | `/pop/states` | List available states |
-| `getPopCrops(state)` | GET | `/pop/crops` | List crops for a state |
-| `getPopDocs(state, crop)` | GET | `/pop/docs` | List PDFs |
-| `getPopDataTree()` | GET | `/pop/data/tree` | Full POP data file tree |
-| `getPopOutputTree()` | GET | `/pop/output/tree` | POP output file tree |
-| `getPopStateTable()` | GET | `/pop/state-table` | Summary of states and crop counts |
-| `runPop(body)` | POST | `/run/pop` | Start POP translation job |
-| `uploadPopFile(file, dest)` | POST | `/pop/upload` or `/pop/upload-chunk` | Upload POP PDF |
-| `deletePopFile(path)` | DELETE | `/pop/files/{path}` | Delete POP file |
-| `deletePopFolder(path)` | DELETE | `/pop/folders/{path}` | Delete POP folder |
-| `createPopFolder(path)` | POST | `/pop/folders` | Create POP folder |
-| `popDownloadUrl(path)` | — | `/pop/download/{path}` | POP file download URL |
-| `popOutputDownloadUrl(state, crop, docName)` | — | `/pop/output` | Translated DOCX download URL |
-| `uploadPopAuditedFile(file, state, crop, docName)` | POST | `/pop/upload-audited` | Upload reviewed translation |
+All other routes return `index.html` (SPA client-side routing).
 
 ---
 
-## `FunctionsPanel.jsx` — FAQ-Cluster UI
+## Development
 
-Main interface for the FAQ pipeline. Key user flows:
+The frontend source is in a separate repository / Docker image (`vicharanashala/faqcluster-frontend`). To run against a local pipeline server:
 
-1. **Select state and crops** — dropdowns populated from pre-pipeline config or uploaded CSV.
-2. **Configure pipeline** — model selection, grid mode, GPU, skip flags.
-3. **Upload raw CSV** — calls `uploadFile()`, file lands in `app-data/`.
-4. **Run pipeline** — calls `runFull()`, gets back `job_id`.
-5. **Monitor job** — polls `getJob(job_id)` every ~2 s; displays live stdout stream.
-6. **Browse results** — calls `getStateTable()` on completion; lists per-state/crop outputs.
-7. **Download FAQ** — calls `outputDownloadUrl(state, crop)` for the final CSV.
+```bash
+# In the frontend repo
+VITE_API_BASE=http://localhost:8031 npm run dev
+```
 
----
+For local development of the full stack:
+```bash
+# Start pipeline server
+cd pipeline_server
+uvicorn pipeline_server:app --host 0.0.0.0 --port 8031 --reload
 
-## `PopTranslationPanel.jsx` — POP-Translation UI
-
-Interface for PDF translation (calls POP server):
-
-1. **Select state and crop** — `getPopStates()` + `getPopCrops()`.
-2. **Select or upload PDF** — `getPopDocs()` to list existing; `uploadPopFile()` for new.
-3. **Configure** — page range, concurrency, prompt file.
-4. **Run** — calls `runPop()`; same job monitor pattern as FAQ pipeline.
-5. **Download DOCX** — `popOutputDownloadUrl(state, crop, docName)` for the translated Word document.
-
----
-
-## Dependencies
-
-| Package | Version | Purpose |
-|---|---|---|
-| react | 18.3.1 | UI framework |
-| vite | 5.2.0 | Build tool and dev server |
-| tailwindcss | 4.3.0 | Utility CSS framework |
-| lucide-react | latest | Icon set |
-| sonner | latest | Toast notifications |
+# Start frontend dev server (separate terminal, frontend repo)
+npm run dev
+# → http://localhost:5173
+```
