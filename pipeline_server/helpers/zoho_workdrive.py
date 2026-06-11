@@ -213,7 +213,28 @@ class ZohoWorkDrive:
         existing = self.find_child(parent_id, name)
         if existing and existing["type"] == "folder":
             return existing["id"]
-        return self.create_folder(name, parent_id)
+        resp = self._post(
+            f"{WD_BASE}/files",
+            json={
+                "data": {
+                    "attributes": {"name": name, "parent_id": parent_id},
+                    "type": "files",
+                }
+            },
+            headers={"Content-Type": "application/vnd.api+json"},
+            timeout=(10, 30),
+        )
+        data = resp.json()["data"]
+        actual_name = data.get("attributes", {}).get("name", name)
+        created_id = data["id"]
+        # Zoho silently renames duplicate folders (e.g. "outputs 09-06-2026 23:10:55:505").
+        # If it did that, the folder we wanted already existed — find and return it.
+        if actual_name != name:
+            print(f"[ZOHO] Duplicate folder detected: Zoho created '{actual_name}' instead of '{name}'. Using existing folder.")
+            original = self.find_child(parent_id, name)
+            if original and original["type"] == "folder":
+                return original["id"]
+        return created_id
 
     # ── File upload ───────────────────────────────────────────────────────────
 

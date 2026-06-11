@@ -837,9 +837,11 @@ def _run_full_sync(r: FullRequest) -> None:
     if skipped_crops:
         print(f"[INFO] Skipping {len(skipped_crops)} already-completed crop(s): {', '.join(skipped_crops)}")
         with _master_lock:
+            district_dict = _master_data.setdefault(state_slug, {}).setdefault(district_folder, {})
+            district_dict["domains"] = r.domains or []
             for _sc in skipped_crops:
                 _sc_slug = slug(_sc)
-                entry = _master_data.setdefault(state_slug, {}).setdefault(district_folder, {}).setdefault(_sc_slug, {})
+                entry = district_dict.setdefault(_sc_slug, {})
                 entry.update({
                     "output_file": f"outputs/repair/{state_slug}/{district_folder}/{_sc_slug}/{district_folder}_{_sc_slug}.csv",
                     "processed": True,
@@ -919,6 +921,7 @@ def _run_full_sync(r: FullRequest) -> None:
             print(f"[INFO] Cleaned up local folder: {crop_out.relative_to(APP_DATA)}")
             _update_master_crop(
                 state_slug, district_folder, crop_slug,
+                domains=r.domains or [],
                 output_file=f"outputs/repair/{state_slug}/{district_folder}/{crop_slug}/{district_folder}_{crop_slug}.csv",
                 processed=True,
             )
@@ -1376,10 +1379,13 @@ def get_next_state(
 #
 # Shape:
 #   { "built_at": "<iso>",
-#     "data": { "<state>": { "<district>": { "<crop>": {
-#       "output_file": str|null, "audit_file": str|null,
-#       "downloaded": bool, "audited": bool, "processed": bool
-#     }}}}}
+#     "data": { "<state>": { "<district>": {
+#       "domains": [str, ...],          ← from state/district/meta.json
+#       "<crop>": {
+#         "output_file": str|null, "audit_file": str|null,
+#         "downloaded": bool, "audited": bool, "processed": bool
+#       }
+#     }}}}
 # ---------------------------------------------------------------------------
 
 _master_ready  = threading.Event()
@@ -1421,6 +1427,17 @@ def _build_master_data_from_zoho() -> dict:
             if district_item["type"] != "folder" or district_item["name"].startswith("."):
                 continue
             district_name = district_item["name"]
+
+            # Read domains from <state>/<district>/meta.json at the Zoho root
+            district_domains: list = []
+            meta_result = zwd.resolve_path(f"{state_name}/{district_name}/meta.json")
+            if meta_result:
+                try:
+                    meta = json.loads(zwd.download_file(meta_result[0]))
+                    district_domains = meta.get("domains", [])
+                except Exception:
+                    pass
+            data.setdefault(state_name, {}).setdefault(district_name, {})["domains"] = district_domains
 
             for crop_item in sorted(zwd.list_folder(district_item["id"]), key=lambda x: x["name"]):
                 if crop_item["type"] != "folder" or crop_item["name"] in ("final",) or crop_item["name"].startswith("."):
@@ -1491,10 +1508,13 @@ def _rebuild_master() -> None:
         _master_ready.set()  # unblock requests even on failure
 
 
-def _update_master_crop(state: str, district: str, crop: str, **updates) -> None:
+def _update_master_crop(state: str, district: str, crop: str, domains: list | None = None, **updates) -> None:
     """Update a single crop entry in memory and re-upload master.json."""
     with _master_lock:
-        entry = _master_data.setdefault(state, {}).setdefault(district, {}).setdefault(crop, {})
+        district_dict = _master_data.setdefault(state, {}).setdefault(district, {})
+        if domains is not None:
+            district_dict["domains"] = domains
+        entry = district_dict.setdefault(crop, {})
         if updates.get("processed") and not entry.get("finished_at"):
             updates["finished_at"] = datetime.now(timezone.utc).isoformat()
         entry.update(updates)
@@ -1509,12 +1529,16 @@ def _master_to_rows() -> list[dict]:
     with _master_lock:
         snapshot = json.loads(json.dumps(_master_data))  # shallow-safe copy under lock
     for state_name, districts in sorted(snapshot.items()):
-        for district_name, crops in sorted(districts.items()):
-            for crop_name, d in sorted(crops.items()):
+        for district_name, district_data in sorted(districts.items()):
+            domains = district_data.get("domains", [])
+            for crop_name, d in sorted(district_data.items()):
+                if crop_name == "domains":
+                    continue
                 rows.append({
                     "state": state_name,
                     "district": district_name,
                     "crop": crop_name,
+                    "domains": domains,
                     "output_file": d.get("output_file"),
                     "audit_file": d.get("audit_file"),
                     "downloaded": d.get("downloaded", False),
