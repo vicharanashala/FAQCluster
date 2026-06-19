@@ -823,14 +823,9 @@ def _run_full_sync(r: FullRequest) -> None:
     out_base = _resolve_safe(r.output_dir) / state_slug / district_folder
 
     def _output_done(crop_slug: str) -> bool:
-        zoho_folder = f"outputs/repair/{state_slug}/{district_folder}/{crop_slug}"
-        _zwd = _get_zoho()
-        result = _zwd.resolve_path(zoho_folder)
-        if result:
-            children = {f["name"] for f in _zwd.list_folder(result[0])}
-            if f"{district_folder}_{crop_slug}.csv" in children or "dedup_faq.csv" in children:
-                return True
-        return False
+        with _master_lock:
+            entry = _master_data.get(state_slug, {}).get(district_folder, {}).get(crop_slug, {})
+        return bool(entry.get("processed") or entry.get("output_file"))
 
     crops_to_run  = [c for c in crops if not _output_done(slug(c))]
     skipped_crops = [c for c in crops if _output_done(slug(c))]
